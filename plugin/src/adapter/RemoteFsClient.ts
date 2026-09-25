@@ -35,13 +35,14 @@ export interface RemoteFsClient {
    *
    * `expectedMtime`, if provided, asks the server to reject the write
    * with `PreconditionFailed` (-32020) when the remote mtime no longer
-   * matches — used by `SftpDataAdapter.writeBuffer` to detect
+   * matches (zero means the file must not exist) — used by `SftpDataAdapter.writeBuffer` to detect
    * concurrent edits from another client. Implementations that can't
    * enforce a precondition (the direct-SFTP wrapper) should ignore the
-   * argument; conflict detection is a best-effort feature, not a
-   * correctness invariant.
+   * argument; the UI must warn that conflict protection is unavailable.
+   * Returns the committed mtime when the transport provides it. A later
+   * stat is not an equivalent version token: another writer may intervene.
    */
-  writeBinary(path: string, data: Buffer, expectedMtime?: number): Promise<void>;
+  writeBinary(path: string, data: Buffer, expectedMtime?: number): Promise<number | void>;
 
   /** Ensure a directory chain exists (idempotent). */
   mkdirp(path: string): Promise<void>;

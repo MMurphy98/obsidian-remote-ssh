@@ -112,13 +112,14 @@ describe('RpcRemoteFsClient', () => {
       onClose: () => () => { /* noop */ },
       call: vi.fn(async (method: string, params: unknown) => {
         calls.push({ method, params });
+        if (method === 'server.info') return { capabilities: ['fs.write.preconditions.v2'] };
         if (method === 'fs.writeBinary') return { mtime: 2 };
         throw new RpcError(-32601, method);
       }),
     } as unknown as RpcClient);
 
     await client.writeBinary('x.bin', Buffer.from([1]), 1234);
-    const params = calls[0].params as { expectedMtime?: number };
+    const params = calls.find(c => c.method === 'fs.writeBinary')!.params as { expectedMtime?: number };
     expect(params.expectedMtime).toBe(1234);
   });
 
@@ -250,5 +251,28 @@ describe('RpcRemoteFsClient', () => {
     const result = await client.readBinaryRange('x.bin', 100, 10);
     expect(result.data.byteLength).toBe(0);
     expect(result.size).toBe(50);
+  });
+});
+
+describe('RpcRemoteFsClient conditional-write contract', () => {
+  it.each([0, 1234])('refuses expectedMtime=%s on an old daemon before sending a write', async expected => {
+    const write = vi.fn(() => ({ mtime: 55 }));
+    const client = new RpcRemoteFsClient(mockRpc({
+      'server.info': () => ({ capabilities: ['fs.writeBinary'] }),
+      'fs.writeBinary': write,
+    }));
+    await expect(client.writeBinary('note.md', Buffer.from('local'), expected)).rejects.toThrow(/upgrade.*daemon|daemon.*upgrade/i);
+    expect(write).not.toHaveBeenCalled();
+  });
+
+  it('uses the committed RPC version and checks the capability once per connection', async () => {
+    const rpc = mockRpc({
+      'server.info': () => ({ capabilities: ['fs.write.preconditions.v2'] }),
+      'fs.writeBinary': () => ({ mtime: 55 }),
+    });
+    const client = new RpcRemoteFsClient(rpc);
+    expect(await client.writeBinary('note.md', Buffer.from('one'), 0)).toBe(55);
+    expect(await client.writeBinary('note.md', Buffer.from('two'), 55)).toBe(55);
+    expect(vi.mocked(rpc.call).mock.calls.filter(([m]) => m === 'server.info')).toHaveLength(1);
   });
 });

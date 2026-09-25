@@ -1265,7 +1265,7 @@ describe('SftpDataAdapter (offline queue while reconnecting)', () => {
     expect(fake.spies.writeBinary).toHaveBeenCalledWith('/v/a.md', expect.any(Buffer), 42);
   });
 
-  it('replayQueuedOp returns conflict on PreconditionFailed without an ancestor', async () => {
+  it('replayQueuedOp retains an unresolved PreconditionFailed as an error', async () => {
     const fake = makeFakeClient({
       files: { '/v/a.md': { data: Buffer.from('initial'), mtime: 100 } },
     });
@@ -1280,14 +1280,14 @@ describe('SftpDataAdapter (offline queue while reconnecting)', () => {
     // No prior read → no ancestor → adapter falls through to the
     // legacy two-choice path. Without an `onWriteConflict` callback,
     // the precondition error rethrows; replayQueuedOp surfaces it as
-    // 'conflict' (= a user-decided outcome, queue moves on).
+    // an error: no user decision authorizes dropping the edit.
     const result = await adapter.replayQueuedOp({
       kind: 'write',
       path: 'a.md',
       contentBase64: Buffer.from('replayed', 'utf8').toString('base64'),
       expectedMtime: 42,
     });
-    expect(result).toEqual({ result: 'conflict' });
+    expect(result).toEqual({ result: 'error', message: expect.stringMatching(/conflict unresolved/i) });
   });
 
   it('replayQueuedOp dispatches mkdir / remove / rename / copy to the underlying client', async () => {
@@ -1379,7 +1379,7 @@ describe('SftpDataAdapter: getResourcePath', () => {
   });
 });
 
-describe('SftpDataAdapter: readBuffer stat-after-read failure', () => {
+describe('SftpDataAdapter: readBuffer stat-before-read failure', () => {
   let readCache: ReadCache;
   let dirCache: DirCache;
   beforeEach(() => {
@@ -1387,11 +1387,11 @@ describe('SftpDataAdapter: readBuffer stat-after-read failure', () => {
     dirCache = new DirCache({ ttlMs: 10000 });
   });
 
-  it('still returns data and caches with mtime=0 when stat-after-read throws', async () => {
+  it('still returns data and caches with mtime=0 when stat-before-read throws', async () => {
     const fake = makeFakeClient({
       files: { '/v/note.md': { data: Buffer.from('content'), mtime: 42 } },
     });
-    // Make stat always reject so the post-read stat path throws.
+    // Make stat always reject so the pre-read version is unknown.
     fake.spies.stat.mockRejectedValue(new Error('stat unavailable'));
 
     const adapter = new SftpDataAdapter(fake.client, '/v', readCache, dirCache, 'v');

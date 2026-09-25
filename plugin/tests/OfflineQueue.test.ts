@@ -1,8 +1,16 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { OfflineQueue, type QueuedOp } from '../src/offline/OfflineQueue';
+
+// Keep real temporary-file I/O while allowing individual failure/race points
+// to be controlled; native ESM fs exports themselves are non-configurable.
+vi.mock('node:fs/promises', async (importOriginal) => ({
+  ...await importOriginal<typeof import('node:fs/promises')>(),
+}));
+
+afterEach(() => vi.restoreAllMocks());
 
 async function tempDir(label: string): Promise<string> {
   return await fs.mkdtemp(path.join(os.tmpdir(), `remote-ssh-queue-${label}-`));
@@ -94,6 +102,140 @@ describe('OfflineQueue', () => {
     expect(next).toBeGreaterThan(Math.max(...ids));
   });
 
+  it('chains successive text and binary saves through real committed mtimes across restart and compaction', async () => {
+    const dir = await tempDir('write-chain');
+    const q = await OfflineQueue.open(dir);
+    const first = await q.enqueueWrite({ kind: 'write', path: 'a.md', contentBase64: 'YQ==', expectedMtime: 100 });
+    const second = await q.enqueueWrite({ kind: 'writeBinary', path: 'a.md', contentBase64: 'Yg==', expectedMtime: 9999 });
+    const third = await q.enqueueWrite({ kind: 'write', path: 'a.md', contentBase64: 'Yw==', expectedMtime: 10000 });
+    expect(q.pending()[1].op).toMatchObject({ expectedMtime: 100, dependsOn: first });
+    expect(q.pending()[2].op).toMatchObject({ expectedMtime: 100, dependsOn: second });
+
+    await q.markCompleted(first, 200);
+    const reopened = await OfflineQueue.open(dir);
+    expect(reopened.pending()[0].op).toMatchObject({ expectedMtime: 200 });
+    expect(reopened.pending()[0].op).not.toHaveProperty('dependsOn');
+    expect(reopened.pending()[1].op).toMatchObject({ expectedMtime: 100, dependsOn: second });
+    await reopened.markCompleted(second, 300);
+    await reopened.compact();
+    const compacted = await OfflineQueue.open(dir);
+    expect(compacted.pending()).toHaveLength(1);
+    expect(compacted.pending()[0]).toMatchObject({ id: third, op: { expectedMtime: 300 } });
+    expect(compacted.pending()[0].op).not.toHaveProperty('dependsOn');
+  });
+
+  it('discarding a predecessor retains the original precondition instead of accepting the remote version', async () => {
+    const dir = await tempDir('discard-chain');
+    const q = await OfflineQueue.open(dir);
+    const first = await q.enqueueWrite({ kind: 'write', path: 'a.md', contentBase64: 'YQ==', expectedMtime: 100 });
+    await q.enqueueWrite({ kind: 'write', path: 'a.md', contentBase64: 'Yg==', expectedMtime: 9999 });
+
+    await q.markCompleted(first);
+
+    const reopened = await OfflineQueue.open(dir);
+    expect(reopened.pending()[0].op).toMatchObject({ expectedMtime: 100 });
+    expect(reopened.pending()[0].op).not.toHaveProperty('dependsOn');
+  });
+
+  it('keeps both the edit and dependency unchanged if persisting completion fails', async () => {
+    const dir = await tempDir('completion-failed');
+    const q = await OfflineQueue.open(dir);
+    const first = await q.enqueueWrite({ kind: 'write', path: 'a.md', contentBase64: 'YQ==', expectedMtime: 100 });
+    await q.enqueueWrite({ kind: 'write', path: 'a.md', contentBase64: 'Yg==', expectedMtime: 9999 });
+    const before = q.pending();
+    vi.spyOn(fs, 'appendFile').mockRejectedValueOnce(new Error('disk full'));
+
+    await expect(q.markCompleted(first, 200)).rejects.toThrow('disk full');
+
+    expect(q.pending()).toEqual(before);
+    expect((await OfflineQueue.open(dir)).pending()).toEqual(before);
+    await q.markCompleted(first, 200);
+    expect(q.pending()[0].op).toMatchObject({ expectedMtime: 200 });
+    expect(q.pending()[0].op).not.toHaveProperty('dependsOn');
+  });
+
+  it('includes a concurrently queued successor in the persisted completion update', async () => {
+    const dir = await tempDir('completion-save-race');
+    const q = await OfflineQueue.open(dir);
+    const first = await q.enqueueWrite({ kind: 'write', path: 'a.md', contentBase64: 'YQ==', expectedMtime: 100 });
+    const saving = q.enqueueWrite({ kind: 'write', path: 'a.md', contentBase64: 'Yg==', expectedMtime: 9999 });
+    const completing = q.markCompleted(first, 200);
+    await Promise.all([saving, completing]);
+
+    const reopened = await OfflineQueue.open(dir);
+    expect(reopened.pending()).toHaveLength(1);
+    expect(reopened.pending()[0].op).toMatchObject({ expectedMtime: 200 });
+    expect(reopened.pending()[0].op).not.toHaveProperty('dependsOn');
+  });
+
+  it('updates every dependent when a legacy or restored queue contains sibling dependencies', async () => {
+    const dir = await tempDir('completion-all-dependents');
+    const q = await OfflineQueue.open(dir);
+    const first = await q.enqueueWrite({ kind: 'write', path: 'a.md', contentBase64: 'YQ==', expectedMtime: 100 });
+    await q.enqueue({ kind: 'write', path: 'a.md', contentBase64: 'Yg==', expectedMtime: 100, dependsOn: first });
+    await q.enqueue({ kind: 'write', path: 'a.md', contentBase64: 'Yw==', expectedMtime: 100, dependsOn: first });
+
+    await q.markCompleted(first, 200);
+
+    const reopened = await OfflineQueue.open(dir);
+    expect(reopened.pending()).toHaveLength(2);
+    for (const entry of reopened.pending()) {
+      expect(entry.op).toMatchObject({ expectedMtime: 200 });
+      expect(entry.op).not.toHaveProperty('dependsOn');
+    }
+  });
+
+  it('follows file and directory rename chains without confusing sibling paths', async () => {
+    const q = await OfflineQueue.open(await tempDir('rename-chain'));
+    const first = await q.enqueueWrite({ kind: 'write', path: 'old/a.md', contentBase64: 'YQ==', expectedMtime: 100 });
+    await q.enqueue({ kind: 'rename', oldPath: 'old', newPath: 'new' });
+    await q.enqueue({ kind: 'rename', oldPath: 'new/a.md', newPath: 'new/b.md' });
+    await q.enqueueWrite({ kind: 'write', path: 'new/b.md', contentBase64: 'Yg==', expectedMtime: 9999 });
+    await q.enqueueWrite({ kind: 'write', path: 'older/a.md', contentBase64: 'Yw==', expectedMtime: 500 });
+
+    expect(q.pending()[3].op).toMatchObject({ expectedMtime: 100, dependsOn: first });
+    expect(q.pending()[4].op).toMatchObject({ expectedMtime: 500 });
+    expect(q.pending()[4].op).not.toHaveProperty('dependsOn');
+    await q.markCompleted(first, 200);
+    expect(q.pending()[2].op).toMatchObject({ expectedMtime: 200 });
+  });
+
+  it.each<QueuedOp>([
+    { kind: 'remove', path: 'dir/a.md' },
+    { kind: 'rmdir', path: 'dir', recursive: true },
+    { kind: 'trashLocal', path: 'dir/a.md' },
+    { kind: 'rename', oldPath: 'dir', newPath: 'moved' },
+  ])('starts a new create-only generation after $kind', async (mutation) => {
+    const q = await OfflineQueue.open(await tempDir(`generation-${mutation.kind}`));
+    await q.enqueueWrite({ kind: 'write', path: 'dir/a.md', contentBase64: 'YQ==', expectedMtime: 100 });
+    await q.enqueue(mutation);
+    await q.enqueueWrite({ kind: 'write', path: 'dir/a.md', contentBase64: 'Yg==', expectedMtime: 9999 });
+
+    expect(q.pending()[2].op).toMatchObject({ expectedMtime: 0 });
+    expect(q.pending()[2].op).not.toHaveProperty('dependsOn');
+  });
+
+  it.each<QueuedOp>([
+    { kind: 'append', path: 'a.md', contentBase64: 'Yg==' },
+    { kind: 'appendBinary', path: 'a.md', contentBase64: 'Yg==' },
+    { kind: 'copy', srcPath: 'b.md', dstPath: 'a.md' },
+  ])('does not propagate a precondition across an untracked $kind mutation', async (mutation) => {
+    const q = await OfflineQueue.open(await tempDir(`barrier-${mutation.kind}`));
+    const first = await q.enqueueWrite({ kind: 'write', path: 'a.md', contentBase64: 'YQ==', expectedMtime: 100 });
+    await q.enqueue(mutation);
+    await q.enqueueWrite({ kind: 'write', path: 'a.md', contentBase64: 'Yw==', expectedMtime: 100 });
+    await q.markCompleted(first, 200);
+
+    expect(q.pending()[1].op).toMatchObject({ expectedMtime: 100 });
+    expect(q.pending()[1].op).not.toHaveProperty('dependsOn');
+  });
+
+  it('treats a write with no known remote base as create-only', async () => {
+    const q = await OfflineQueue.open(await tempDir('unknown-base'));
+    await q.enqueueWrite({ kind: 'write', path: 'new.md', contentBase64: 'YQ==' });
+    expect(q.pending()[0].op).toMatchObject({ expectedMtime: 0 });
+  });
+
   // ─── compaction ─────────────────────────────────────────────────────────
 
   it('compaction shrinks the on-disk log after enough completions', async () => {
@@ -130,6 +272,58 @@ describe('OfflineQueue', () => {
     expect(reopened.pending()).toEqual([]);
   });
 
+  it('does not reuse completed IDs after compaction empties the queue', async () => {
+    const dir = await tempDir('compacted-id-stream');
+    const q = await OfflineQueue.open(dir);
+    const id = await q.enqueue(textWrite('a.md', 'first'));
+    await q.markCompleted(id);
+    await q.compact();
+    const reopened = await OfflineQueue.open(dir);
+    expect(await reopened.enqueue(textWrite('a.md', 'second'))).toBeGreaterThan(id);
+  });
+
+  it('keeps a save queued while a compaction replacement is in progress', async () => {
+    const dir = await tempDir('compact-save-race');
+    const q = await OfflineQueue.open(dir);
+    await q.enqueue(textWrite('a.md', 'first'));
+    const originalRename = fs.rename;
+    let release!: () => void;
+    let entered!: () => void;
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    vi.spyOn(fs, 'rename').mockImplementationOnce(async (from, to) => {
+      entered();
+      await blocked;
+      return originalRename(from, to);
+    });
+    const append = vi.spyOn(fs, 'appendFile');
+    const compacting = q.compact();
+    await started;
+    const saving = q.enqueue(textWrite('b.md', 'second'));
+    try {
+      // No append may race with replacing the log it appends to.
+      await Promise.resolve();
+      expect(append).not.toHaveBeenCalled();
+    } finally {
+      release();
+      await Promise.all([compacting, saving]);
+    }
+    const reopened = await OfflineQueue.open(dir);
+    expect(reopened.pending().map(e => (e.op as { path: string }).path)).toEqual(['a.md', 'b.md']);
+  });
+
+  it('retains pending edits in memory when clearing fails to persist', async () => {
+    const q = await OfflineQueue.open(await tempDir('clear-failed'));
+    await q.enqueue(textWrite('a.md', 'first'));
+    vi.spyOn(fs, 'writeFile').mockRejectedValueOnce(new Error('disk full'));
+
+    await expect(q.clear()).rejects.toThrow('disk full');
+
+    expect(q.pending()).toHaveLength(1);
+    await q.enqueue(textWrite('b.md', 'second'));
+    expect(q.pending()).toHaveLength(2);
+  });
+
   // ─── cap enforcement ────────────────────────────────────────────────────
 
   it('rejects an enqueue that would exceed the byte cap', async () => {
@@ -146,6 +340,17 @@ describe('OfflineQueue', () => {
     // Next enqueue should still get a small id (no gap from the rejected one).
     const next = await q.enqueue(textWrite('next.md', 'tiny'));
     expect(next).toBe(pending[0].id + 1);
+  });
+
+  it('enforces the byte cap across concurrent saves', async () => {
+    const q = await OfflineQueue.open(await tempDir('cap-concurrent'), { maxBytes: 250 });
+    const results = await Promise.allSettled([
+      q.enqueue(textWrite('a.md', 'x'.repeat(50))),
+      q.enqueue(textWrite('b.md', 'x'.repeat(50))),
+    ]);
+    expect(results.filter(r => r.status === 'fulfilled')).toHaveLength(1);
+    expect(q.pending()).toHaveLength(1);
+    expect(q.stats().bytes).toBeLessThanOrEqual(250);
   });
 
   // ─── malformed-line tolerance ───────────────────────────────────────────

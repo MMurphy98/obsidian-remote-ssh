@@ -72,7 +72,7 @@ describe('QueueReplayer', () => {
       textWrite('b.md', 'two'),
     ]);
     const { target } = makeTarget([
-      { result: 'conflict' }, // user picked keep-theirs
+      { result: 'discarded' }, // user picked keep-theirs
       { result: 'ok' },
     ]);
     const report = await new QueueReplayer(q, target).run();
@@ -163,4 +163,36 @@ describe('QueueReplayer', () => {
     await new QueueReplayer(q, target).run();
     expect(calls).toEqual(allKinds);
   });
+  it('keeps cancellation and all dependent mutations pending', async () => {
+    const q = await tempQueue('cancel', [textWrite('a.md', 'edit'), { kind: 'remove', path: 'a.md' }]);
+    const { target, calls } = makeTarget([{ result: 'cancelled' }]);
+    const report = await new QueueReplayer(q, target).run();
+    expect(report).toEqual({ drained: 0, conflicts: 0, errors: [] });
+    expect(q.pending()).toHaveLength(2);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('includes edits appended while an earlier replay is waiting', async () => {
+    const q = await tempQueue('tail', [textWrite('a.md', 'one')]);
+    let calls = 0;
+    const target: ReplayTarget = { replayQueuedOp: async () => {
+      if (++calls === 1) await q.enqueue(textWrite('b.md', 'two'));
+      return { result: 'ok' };
+    } };
+    expect((await new QueueReplayer(q, target).run()).drained).toBe(2);
+    expect(q.pending()).toHaveLength(0);
+  });
+
+  it('joins overlapping drains instead of applying the same mutation twice', async () => {
+    const q = await tempQueue('overlap', [{ kind: 'rename', oldPath: 'a', newPath: 'b' }]);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const replay = vi.fn(async () => { await gate; return { result: 'ok' as const }; });
+    const first = new QueueReplayer(q, { replayQueuedOp: replay }).run();
+    const second = new QueueReplayer(q, { replayQueuedOp: replay }).run();
+    release();
+    await Promise.all([first, second]);
+    expect(replay).toHaveBeenCalledTimes(1);
+  });
+
 });

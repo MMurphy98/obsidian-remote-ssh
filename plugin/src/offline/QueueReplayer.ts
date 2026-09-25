@@ -8,8 +8,9 @@ import { errorMessage } from "../util/errorMessage";
  * can satisfy the same contract.
  */
 export type ReplayOutcome =
-  | { result: 'ok' }
-  | { result: 'conflict' }
+  | { result: 'ok'; mtime?: number }
+  | { result: 'discarded' }
+  | { result: 'cancelled' }
   | { result: 'error'; message: string };
 
 export interface ReplayTarget {
@@ -19,7 +20,7 @@ export interface ReplayTarget {
 export interface ReplayReport {
   /** Ops that landed cleanly (or whose conflict modal returned a definitive resolution). */
   drained: number;
-  /** Ops the user resolved by picking `keep-theirs` / cancelling — counted as user-decided. */
+  /** Ops explicitly discarded by picking `keep-theirs`. Cancellation never completes an entry. */
   conflicts: number;
   /** Ops that errored; queue entry stays pending for the next reconnect to retry. */
   errors: Array<{ id: number; message: string }>;
@@ -34,8 +35,8 @@ export interface ReplayReport {
  *
  * - Replays oldest-first so a chain of edits to the same file lands
  *   in the order the user typed them.
- * - On a successful op (`ok`) or a user-resolved conflict
- *   (`conflict`), marks the queue entry completed and continues.
+ * - Only a committed write (`ok`) or explicit discard (`discarded`)
+ *   completes an entry. Cancellation stops the drain without removing it.
  * - On a transport error (`error`), logs and STOPS so the next
  *   reconnect retries from the same entry. We could choose to
  *   continue with later entries, but the user's mental model is
@@ -43,19 +44,33 @@ export interface ReplayReport {
  *   depends on an earlier rename / mkdir.
  */
 export class QueueReplayer {
+  private static readonly running = new WeakMap<OfflineQueue, Promise<ReplayReport>>();
+
   constructor(
     private readonly queue: OfflineQueue,
     private readonly target: ReplayTarget,
   ) {}
 
-  async run(): Promise<ReplayReport> {
+  run(): Promise<ReplayReport> {
+    const running = QueueReplayer.running.get(this.queue);
+    if (running) return running;
+    const drain = this.drain().finally(() => { QueueReplayer.running.delete(this.queue); });
+    QueueReplayer.running.set(this.queue, drain);
+    return drain;
+  }
+
+  private async drain(): Promise<ReplayReport> {
     const report: ReplayReport = { drained: 0, conflicts: 0, errors: [] };
     const initialPending = this.queue.pending();
     if (initialPending.length === 0) return report;
 
     logger.info(`QueueReplayer: draining ${initialPending.length} pending entries`);
 
-    for (const entry of initialPending) {
+    for (;;) {
+      // Re-read after each completion: versions may have advanced, and a save
+      // made while a conflict modal was open belongs at the tail of this run.
+      const entry = this.queue.pending()[0];
+      if (!entry) break;
       let outcome: ReplayOutcome;
       try {
         outcome = await this.target.replayQueuedOp(entry.op);
@@ -71,19 +86,20 @@ export class QueueReplayer {
       }
 
       if (outcome.result === 'ok') {
-        await this.queue.markCompleted(entry.id);
+        await this.queue.markCompleted(entry.id, outcome.mtime);
         report.drained++;
         continue;
       }
 
-      if (outcome.result === 'conflict') {
-        // The user chose `keep-theirs` or cancelled the modal. Either
-        // way the op is decided; mark complete so we don't re-prompt
-        // on the next reconnect.
+      if (outcome.result === 'discarded') {
+        // Only an explicit decision to abandon this edit grants permission
+        // to remove it. Later local edits retain their own preconditions.
         await this.queue.markCompleted(entry.id);
         report.conflicts++;
         continue;
       }
+
+      if (outcome.result === 'cancelled') break;
 
       // outcome.result === 'error'
       report.errors.push({ id: entry.id, message: outcome.message });

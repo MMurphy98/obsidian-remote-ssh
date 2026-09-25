@@ -33,7 +33,8 @@ import type { PathMapper } from '../path/PathMapper';
 import type { ResourceBridge } from './ResourceBridge';
 import type { RemoteEntry } from '../types';
 import type { AncestorTracker } from '../conflict/AncestorTracker';
-import type { ConflictResolver } from '../conflict/ConflictResolver';
+import { ConflictResolutionStopped, type ConflictResolver } from '../conflict/ConflictResolver';
+import type { ReplayOutcome } from '../offline/QueueReplayer';
 import type { OfflineQueue, QueuedOp } from '../offline/OfflineQueue';
 import type { TransferTracker } from '../util/TransferTracker';
 import { logger } from '../util/logger';
@@ -461,17 +462,11 @@ export class SftpDataAdapter {
   async write(normalizedPath: string, data: string, _options?: DataWriteOptions): Promise<void> {
     const __t1 = perfTracer.begin('S.adp');
     try {
-      if (this.reconnecting) {
+      if (this.shouldQueueWrites()) {
         await this.queueOrThrowText(normalizedPath, data);
         return;
       }
       await this.writeBuffer(normalizedPath, Buffer.from(data, 'utf8'), true);
-      // After a successful text write, the file we just wrote IS the
-      // new ancestor for any later edit cycle.
-      if (this.ancestorTracker) {
-        const cached = this.readCache.peek(this.toRemote(normalizedPath));
-        this.ancestorTracker.remember(normalizedPath, data, cached?.mtime ?? 0);
-      }
       this.applied([normalizedPath], r => r.reflectWrite(normalizedPath));
     } finally {
       perfTracer.end(__t1, { op: 'write', path: normalizedPath, bytes: data.length });
@@ -481,7 +476,7 @@ export class SftpDataAdapter {
   async writeBinary(normalizedPath: string, data: ArrayBuffer, _options?: DataWriteOptions): Promise<void> {
     const __t1 = perfTracer.begin('S.adp');
     try {
-      if (this.reconnecting) {
+      if (this.shouldQueueWrites()) {
         await this.queueOrThrowBinary(normalizedPath, Buffer.from(data));
         return;
       }
@@ -495,15 +490,8 @@ export class SftpDataAdapter {
   async append(normalizedPath: string, data: string, options?: DataWriteOptions): Promise<void> {
     const __t1 = perfTracer.begin('S.adp');
     try {
-      if (this.reconnecting) {
-        // Read through readBuffer, which serves a cached hit at once and
-        // otherwise waits for the session (bounded — see ReconnectWait)
-        // before giving up. Then splice and queue as a full write: reading
-        // and writing as separate ops would explode the queue size when the
-        // editor appends in a tight loop.
-        let existing = '';
-        try { existing = await this.read(normalizedPath); }
-        catch { /* file did not exist; start empty so append acts like create */ }
+      if (this.shouldQueueWrites()) {
+        const existing = this.pendingContentForUpdate(normalizedPath, true).toString('utf8');
         await this.queueOrThrowText(normalizedPath, existing + data);
         return;
       }
@@ -519,10 +507,8 @@ export class SftpDataAdapter {
   async appendBinary(normalizedPath: string, data: ArrayBuffer, options?: DataWriteOptions): Promise<void> {
     const __t1 = perfTracer.begin('S.adp');
     try {
-      if (this.reconnecting) {
-        let existing: Buffer;
-        try { existing = await this.readBuffer(normalizedPath); }
-        catch { existing = Buffer.alloc(0); }
+      if (this.shouldQueueWrites()) {
+        const existing = this.pendingContentForUpdate(normalizedPath, true);
         const merged = Buffer.concat([existing, Buffer.from(data)]);
         await this.queueOrThrowBinary(normalizedPath, merged);
         return;
@@ -554,8 +540,8 @@ export class SftpDataAdapter {
   ): Promise<string> {
     const __t1 = perfTracer.begin('S.adp');
     try {
-      if (this.reconnecting) {
-        const current = await this.read(normalizedPath);
+      if (this.shouldQueueWrites()) {
+        const current = this.pendingContentForUpdate(normalizedPath, false).toString('utf8');
         const next = fn(current);
         await this.queueOrThrowText(normalizedPath, next);
         return next;
@@ -570,7 +556,7 @@ export class SftpDataAdapter {
   }
 
   async mkdir(normalizedPath: string): Promise<void> {
-    if (this.reconnecting) {
+    if (this.shouldQueueWrites()) {
       await this.queueOrThrowMutation({ kind: 'mkdir', path: normalizedPath });
       return;
     }
@@ -584,7 +570,8 @@ export class SftpDataAdapter {
     const __t1 = perfTracer.begin('S.adp');
     try {
       const remote = this.toRemote(normalizedPath);
-      if (this.reconnecting) {
+      const queued = this.shouldQueueWrites();
+      if (queued) {
         await this.queueOrThrowMutation({ kind: 'remove', path: normalizedPath });
       } else {
         await this.client.remove(remote);
@@ -594,10 +581,8 @@ export class SftpDataAdapter {
       // Reflect only when the delete actually hit the remote. While
       // reconnecting the op is merely queued; mirroring the model now
       // would drop the entry locally even though the file still
-      // exists remotely, and a failed replay would leave them
-      // permanently diverged (the QueueReplayer path does not
-      // re-reflect).
-      if (!this.reconnecting) this.applied([normalizedPath], r => r.reflectRemove(normalizedPath));
+      // exists remotely. The replay path reflects it after remote success.
+      if (!queued) this.applied([normalizedPath], r => r.reflectRemove(normalizedPath));
     } finally {
       perfTracer.end(__t1, { op: 'remove', path: normalizedPath });
     }
@@ -605,7 +590,8 @@ export class SftpDataAdapter {
 
   async rmdir(normalizedPath: string, recursive: boolean): Promise<void> {
     const remote = this.toRemote(normalizedPath);
-    if (this.reconnecting) {
+    const queued = this.shouldQueueWrites();
+    if (queued) {
       await this.queueOrThrowMutation({ kind: 'rmdir', path: normalizedPath, recursive });
     } else {
       await this.client.rmdir(remote, recursive);
@@ -616,7 +602,7 @@ export class SftpDataAdapter {
     }
     this.invalidateTree(remote);
     // See `remove`: only mirror once the rmdir actually applied.
-    if (!this.reconnecting) this.applied([normalizedPath], r => r.reflectRemove(normalizedPath));
+    if (!queued) this.applied([normalizedPath], r => r.reflectRemove(normalizedPath));
   }
 
   async rename(oldPath: string, newPath: string): Promise<void> {
@@ -624,7 +610,8 @@ export class SftpDataAdapter {
     try {
       const oldRemote = this.toRemote(oldPath);
       const newRemote = this.toRemote(newPath);
-      if (this.reconnecting) {
+      const queued = this.shouldQueueWrites();
+      if (queued) {
         await this.queueOrThrowMutation({ kind: 'rename', oldPath, newPath });
       } else {
         await this.client.mkdirp(parentDirRemote(newRemote));
@@ -640,7 +627,7 @@ export class SftpDataAdapter {
       // See `remove`: only mirror once the rename actually applied.
       // Echo both paths — some watchers split a rename into
       // delete(old) + create(new).
-      if (!this.reconnecting) this.applied([oldPath, newPath], r => r.reflectRename(oldPath, newPath));
+      if (!queued) this.applied([oldPath, newPath], r => r.reflectRename(oldPath, newPath));
     } finally {
       perfTracer.end(__t1, { op: 'rename', path: oldPath, newPath });
     }
@@ -648,7 +635,7 @@ export class SftpDataAdapter {
 
   async copy(oldPath: string, newPath: string): Promise<void> {
     const newRemote = this.toRemote(newPath);
-    if (this.reconnecting) {
+    if (this.shouldQueueWrites()) {
       await this.queueOrThrowMutation({ kind: 'copy', srcPath: oldPath, dstPath: newPath });
     } else {
       const oldRemote = this.toRemote(oldPath);
@@ -696,14 +683,12 @@ export class SftpDataAdapter {
    *
    *   - `ok` — the op landed cleanly (or the user picked
    *     `keep-mine` / `merged` in the 3-way modal).
-   *   - `conflict` — the user cancelled the conflict modal or chose
-   *     `keep-theirs`; the op should be considered NOT-fulfilled,
-   *     but the queue entry can still be marked completed because
-   *     the user has actively decided not to apply it.
+   *   - `discarded` — the user explicitly chose `keep-theirs`.
+   *   - `cancelled` — leave this and all subsequent operations pending.
    *   - `error` — anything else (network, permission, etc.). The
    *     queue entry stays pending so the next reconnect can retry.
    */
-  async replayQueuedOp(op: QueuedOp): Promise<{ result: 'ok' } | { result: 'conflict' } | { result: 'error'; message: string }> {
+  async replayQueuedOp(op: QueuedOp): Promise<ReplayOutcome> {
     if (this.reconnecting) {
       return { result: 'error', message: 'replayQueuedOp called while reconnecting' };
     }
@@ -711,52 +696,78 @@ export class SftpDataAdapter {
       switch (op.kind) {
         case 'write': {
           const data = Buffer.from(op.contentBase64, 'base64');
-          await this.writeBuffer(op.path, data, true, op.expectedMtime);
-          return { result: 'ok' };
+          const mtime = await this.writeBuffer(op.path, data, true, { mtime: op.expectedMtime ?? 0 });
+          return { result: 'ok', ...(mtime !== undefined ? { mtime } : {}) };
         }
         case 'writeBinary': {
           const data = Buffer.from(op.contentBase64, 'base64');
-          await this.writeBuffer(op.path, data, false, op.expectedMtime);
-          return { result: 'ok' };
+          const mtime = await this.writeBuffer(op.path, data, false, { mtime: op.expectedMtime ?? 0 });
+          return { result: 'ok', ...(mtime !== undefined ? { mtime } : {}) };
         }
-        case 'append': {
-          const data = Buffer.from(op.contentBase64, 'base64').toString('utf8');
-          await this.append(op.path, data);
-          return { result: 'ok' };
-        }
+        case 'append':
         case 'appendBinary': {
-          const data = Buffer.from(op.contentBase64, 'base64');
-          const ab = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
-          await this.appendBinary(op.path, ab);
+          // Older logs can contain append operations. Replay against a
+          // confirmed remote baseline, never via the public queuing gate.
+          const remote = this.toRemote(op.path);
+          const exists = await this.client.exists(remote);
+          const base = exists ? await this.readBufferOverWire(remote, op.path) : Buffer.alloc(0);
+          const data = Buffer.concat([base, Buffer.from(op.contentBase64, 'base64')]);
+          await this.writeBuffer(op.path, data, op.kind === 'append', {
+            mtime: exists ? (this.readCache.peek(remote)?.mtime ?? 0) : 0,
+          });
+          this.applied([op.path], r => r.reflectWrite(op.path));
           return { result: 'ok' };
         }
-        case 'mkdir':
-          await this.mkdir(op.path);
+        case 'mkdir': {
+          const remote = this.toRemote(op.path);
+          await this.client.mkdirp(remote);
+          this.dirCache.invalidate(parentDirRemote(remote));
+          this.applied([op.path], r => r.reflectMkdir(op.path));
           return { result: 'ok' };
-        case 'remove':
-          await this.remove(op.path);
+        }
+        case 'remove': {
+          const remote = this.toRemote(op.path);
+          await this.client.remove(remote);
+          this.invalidatePath(remote);
+          this.ancestorTracker?.invalidate(op.path);
+          this.applied([op.path], r => r.reflectRemove(op.path));
           return { result: 'ok' };
-        case 'rmdir':
-          await this.rmdir(op.path, op.recursive);
+        }
+        case 'rmdir': {
+          const remote = this.toRemote(op.path);
+          await this.client.rmdir(remote, op.recursive);
+          this.invalidateTree(remote);
+          this.applied([op.path], r => r.reflectRemove(op.path));
           return { result: 'ok' };
-        case 'rename':
-          await this.rename(op.oldPath, op.newPath);
+        }
+        case 'rename': {
+          const oldRemote = this.toRemote(op.oldPath);
+          const newRemote = this.toRemote(op.newPath);
+          await this.client.mkdirp(parentDirRemote(newRemote));
+          await this.client.rename(oldRemote, newRemote);
+          this.invalidateTree(oldRemote);
+          this.invalidatePath(newRemote);
+          this.ancestorTracker?.invalidate(op.oldPath);
+          this.applied([op.oldPath, op.newPath], r => r.reflectRename(op.oldPath, op.newPath));
           return { result: 'ok' };
-        case 'copy':
-          await this.copy(op.srcPath, op.dstPath);
+        }
+        case 'copy': {
+          const newRemote = this.toRemote(op.dstPath);
+          await this.client.mkdirp(parentDirRemote(newRemote));
+          await this.client.copy(this.toRemote(op.srcPath), newRemote);
+          this.invalidatePath(newRemote);
           return { result: 'ok' };
+        }
         case 'trashLocal':
-          await this.trashLocal(op.path);
-          return { result: 'ok' };
+          return this.replayQueuedOp({ kind: 'rename', oldPath: op.path, newPath: '.trash/' + op.path });
       }
     } catch (e) {
       const msg = errorMessage(e);
-      // The 3-way merge path's `cancel` and `keep-theirs` branches
-      // rethrow the original PreconditionFailed; treat that as a
-      // user-driven decision rather than an error so the queue can
-      // mark the entry done and move on.
+      if (e instanceof ConflictResolutionStopped) {
+        return { result: e.decision };
+      }
       if (isPreconditionFailed(e)) {
-        return { result: 'conflict' };
+        return { result: 'error', message: `Write conflict unresolved; no resolution was committed. ${msg}` };
       }
       return { result: 'error', message: msg };
     }
@@ -764,15 +775,57 @@ export class SftpDataAdapter {
 
   // ─── offline queue helpers (E2-β) ──────────────────────────────────────
 
+  /** New edits must remain behind unresolved edits even after SSH recovers. */
+  private shouldQueueWrites(): boolean {
+    return this.reconnecting || (this.offlineQueue?.stats().entries ?? 0) > 0;
+  }
+
+  /**
+   * Read the user's pending version for append/process. Fetching from the
+   * remote here could replace unsent content, and a read failure is not
+   * proof that a file is empty. Follow only mutations whose effect we can
+   * reconstruct from the persisted log; otherwise fail without changing it.
+   */
+  private pendingContentForUpdate(normalizedPath: string, allowCreate: boolean): Buffer {
+    if (!this.offlineQueue) throw reconnectingError();
+    let lookupPath = normalizedPath;
+    const contains = (parent: string, child: string): boolean => child === parent || child.startsWith(parent + '/');
+    const absent = (): Buffer => {
+      if (allowCreate) return Buffer.alloc(0);
+      throw new Error(`Cannot process "${normalizedPath}": a pending operation removed the file`);
+    };
+    for (const { op } of this.offlineQueue.pending().reverse()) {
+      if ((op.kind === 'write' || op.kind === 'writeBinary') && op.path === lookupPath) {
+        return Buffer.from(op.contentBase64, 'base64');
+      }
+      if (op.kind === 'rename') {
+        if (contains(op.newPath, lookupPath)) lookupPath = op.oldPath + lookupPath.slice(op.newPath.length);
+        else if (contains(op.oldPath, lookupPath)) return absent();
+      } else if (
+        (op.kind === 'remove' || op.kind === 'rmdir' || op.kind === 'trashLocal') && contains(op.path, lookupPath)
+      ) {
+        return absent();
+      } else if (
+        ((op.kind === 'append' || op.kind === 'appendBinary') && op.path === lookupPath)
+        || (op.kind === 'copy' && contains(op.dstPath, lookupPath))
+      ) {
+        throw new Error(`Cannot safely update "${normalizedPath}": pending source content is unavailable`);
+      }
+    }
+    const cached = this.readCache.peek(this.toRemote(lookupPath));
+    if (cached) return cached.data;
+    throw new Error(`Cannot safely update "${normalizedPath}": no cached or pending baseline is available`);
+  }
+
   /**
    * Append a text write to the offline queue and refresh local
    * caches so the editor sees the just-written content. Throws the
    * legacy `reconnecting` error when no queue is wired.
    *
-   * The queued op carries `expectedMtime` (the cached mtime at
-   * enqueue time — i.e. the mtime the file had when the user started
-   * typing) so the replayer can route through the 3-way merge UI on
-   * conflict-during-replay.
+   * The queue links repeated saves to their pending predecessor. Only the
+   * first save takes its expected version from the cache; subsequent saves
+   * inherit the real committed version through a persisted completion.
+   * Synthetic editor-cache timestamps never become dependency baselines.
    *
    * The ancestor tracker is intentionally NOT refreshed here:
    * keeping the original "what user read" snapshot is what makes the
@@ -785,11 +838,11 @@ export class SftpDataAdapter {
     const remote = this.toRemote(normalizedPath);
     const cached = this.readCache.peek(remote);
     const buf = Buffer.from(data, 'utf8');
-    await this.offlineQueue.enqueue({
+    await this.offlineQueue.enqueueWrite({
       kind: 'write',
       path: normalizedPath,
       contentBase64: buf.toString('base64'),
-      expectedMtime: cached?.mtime,
+      expectedMtime: cached?.mtime ?? 0,
     });
     const synthMtime = Date.now();
     this.readCache.put(remote, buf, synthMtime);
@@ -800,11 +853,11 @@ export class SftpDataAdapter {
     if (!this.offlineQueue) throw reconnectingError();
     const remote = this.toRemote(normalizedPath);
     const cached = this.readCache.peek(remote);
-    await this.offlineQueue.enqueue({
+    await this.offlineQueue.enqueueWrite({
       kind: 'writeBinary',
       path: normalizedPath,
       contentBase64: buf.toString('base64'),
-      expectedMtime: cached?.mtime,
+      expectedMtime: cached?.mtime ?? 0,
     });
     const synthMtime = Date.now();
     this.readCache.put(remote, buf, synthMtime);
@@ -824,10 +877,10 @@ export class SftpDataAdapter {
    * Fetch (or revalidate) the file's contents.
    *
    * If the cache has an entry, stat the remote and reuse the cached buffer
-   * when mtimes agree. Otherwise read the file, then opportunistically
-   * stat it so the cache entry has a real mtime to compare against next
-   * time. The opportunistic stat after a fresh read is best-effort: a
-   * failure is logged but does not block the read result.
+   * when mtimes agree. On a cache miss, capture the version before reading:
+   * a later stat could pair old bytes with another writer's new version and
+   * incorrectly authorize an overwrite. A failed stat leaves a conservative
+   * zero precondition without preventing the read itself.
    */
   private async readBuffer(normalizedPath: string): Promise<Buffer> {
     const remote = this.toRemote(normalizedPath);
@@ -901,14 +954,14 @@ export class SftpDataAdapter {
       }
     }
 
-    const data = await this.client.readBinary(remote);
     let mtime = 0;
     try {
       const s = await this.client.stat(remote);
       mtime = s.mtime;
     } catch (e) {
-      logger.warn(`stat-after-read failed for "${remote}": ${errorMessage(e)}`);
+      logger.warn(`stat-before-read failed for "${remote}": ${errorMessage(e)}`);
     }
+    const data = await this.client.readBinary(remote);
     this.readCache.put(remote, data, mtime);
     return data;
   }
@@ -1025,8 +1078,8 @@ export class SftpDataAdapter {
     normalizedPath: string,
     data: Buffer,
     isText: boolean,
-    expectedMtimeOverride?: number,
-  ): Promise<void> {
+    expectedMtimeOverride?: { mtime: number },
+  ): Promise<number | undefined> {
     const remote = this.toRemote(normalizedPath);
     const parent = parentDirRemote(remote);
     if (parent && parent !== remote) {
@@ -1034,19 +1087,22 @@ export class SftpDataAdapter {
     }
 
     const cached = this.readCache.peek(remote);
-    const expectedMtime = expectedMtimeOverride ?? cached?.mtime;
+    const expectedMtime = expectedMtimeOverride ? expectedMtimeOverride.mtime : cached?.mtime;
     let writtenData = data;
+    let committedMtime: number | undefined;
     const txId = this.transferTracker?.begin('up', normalizedPath, data.length) ?? null;
     try {
       try {
-        await this.client.writeBinary(remote, writtenData, expectedMtime);
+        committedMtime = (await this.client.writeBinary(remote, writtenData, expectedMtime)) ?? undefined;
       } catch (e) {
         if (expectedMtime === undefined || !isPreconditionFailed(e) || !this.conflictResolver) {
           throw e;
         }
-        writtenData = await this.conflictResolver.resolve(
+        const resolved = await this.conflictResolver.resolve(
           normalizedPath, remote, writtenData, isText, e,
         );
+        writtenData = resolved.data;
+        committedMtime = resolved.mtime;
       }
     } finally {
       this.transferTracker?.end(txId);
@@ -1056,15 +1112,21 @@ export class SftpDataAdapter {
     // disk too, so the next Obsidian start reads the real settings (#342/#429).
     this.writeThroughConfig(normalizedPath, writtenData);
 
-    let mtime = 0;
-    try {
-      const s = await this.client.stat(remote);
-      mtime = s.mtime;
-    } catch (e) {
-      logger.warn(`stat-after-write failed for "${remote}": ${errorMessage(e)}`);
+    let mtime = committedMtime ?? 0;
+    if (committedMtime === undefined) {
+      try {
+        mtime = (await this.client.stat(remote)).mtime;
+      } catch (e) {
+        logger.warn(`stat-after-write failed for "${remote}": ${errorMessage(e)}`);
+      }
     }
     this.readCache.put(remote, writtenData, mtime);
+    if (isText) this.ancestorTracker?.remember(normalizedPath, writtenData.toString('utf8'), mtime);
     this.dirCache.invalidate(parent);
+    // A later snapshot was based on this edit's original bytes. If the user
+    // merged in remote changes, that snapshot must conflict again rather
+    // than automatically overwrite the new merge result.
+    return writtenData.equals(data) ? committedMtime : undefined;
   }
 
 
@@ -1144,4 +1206,3 @@ function reconnectingError(): Error {
 function disconnectedError(): Error {
   return new Error('Remote SSH: the connection was closed — reconnect to read this file');
 }
-

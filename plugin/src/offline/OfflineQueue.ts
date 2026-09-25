@@ -14,8 +14,8 @@ import { errorMessage } from "../util/errorMessage";
  * so the queue's encoded form maps 1:1 onto a replayed `fs.write*`.
  */
 export type QueuedOp =
-  | { kind: 'write'; path: string; contentBase64: string; expectedMtime?: number }
-  | { kind: 'writeBinary'; path: string; contentBase64: string; expectedMtime?: number }
+  | { kind: 'write'; path: string; contentBase64: string; expectedMtime?: number; dependsOn?: number }
+  | { kind: 'writeBinary'; path: string; contentBase64: string; expectedMtime?: number; dependsOn?: number }
   | { kind: 'append'; path: string; contentBase64: string }
   | { kind: 'appendBinary'; path: string; contentBase64: string }
   | { kind: 'mkdir'; path: string }
@@ -24,6 +24,8 @@ export type QueuedOp =
   | { kind: 'rename'; oldPath: string; newPath: string }
   | { kind: 'copy'; srcPath: string; dstPath: string }
   | { kind: 'trashLocal'; path: string };
+
+export type QueuedWriteOp = Extract<QueuedOp, { kind: 'write' | 'writeBinary' }>;
 
 export interface QueueEntry {
   /** Monotonically increasing within a queue's lifetime; survives restarts. */
@@ -55,19 +57,19 @@ export const DEFAULT_MAX_BYTES: number = 500 * 1024 * 1024;
 /**
  * Append-only JSONL log of pending offline writes, persisted under
  * the plugin's queue directory so an Electron restart doesn't drop
- * the user's edits. The log holds two kinds of records:
+ * the user's edits. The log holds three kinds of records:
  *
  *   {"type":"op","id":N,"ts":...,"op":{...}}     — enqueue
- *   {"type":"completed","id":N,"ts":...}          — replay/discard
+ *   {"type":"completed","id":N,"ts":...,"committedMtime":...} — replay/discard
+ *   {"type":"watermark","nextId":N}           — ID continuity after compaction
  *
  * On `open()`, the log is replayed line-by-line; any `op` record
  * without a matching `completed` becomes a pending entry. When the
  * log file grows past 2× the live pending bytes, a compaction pass
  * rewrites it without the completed-and-tombstoned entries.
  *
- * Concurrency: this class assumes a single owner (the plugin
- * instance). Two writers to the same dir would interleave appends
- * and corrupt accounting.
+ * Mutations within one owner are serialized, including appends and atomic
+ * log replacements. Separate instances must still not share one directory.
  */
 export class OfflineQueue {
   private readonly logFile: string;
@@ -79,6 +81,7 @@ export class OfflineQueue {
   private bytesUsed = 0;
   /** Bytes currently on disk in the log file (incl. tombstones, pre-compaction). */
   private logFileBytes = 0;
+  private mutations: Promise<void> = Promise.resolve();
 
   private constructor(dir: string, maxBytes: number) {
     this.logFile = path.join(dir, 'log.jsonl');
@@ -103,17 +106,32 @@ export class OfflineQueue {
    * the configured cap (so the user gets a loud failure rather than
    * a silent disk fill).
    */
-  async enqueue(op: QueuedOp): Promise<number> {
-    const entry: QueueEntry = { id: this.nextId++, ts: Date.now(), op };
+  enqueue(op: QueuedOp): Promise<number> {
+    const snapshot = { ...op };
+    return this.mutate(() => this.appendOp(snapshot));
+  }
+
+  /**
+   * Queue a full-file save against the same remote version as its predecessor.
+   * Local cache mtimes can be synthetic; only a replay's acknowledged remote
+   * mtime may advance a dependent write's precondition.
+   */
+  enqueueWrite(op: QueuedWriteOp): Promise<number> {
+    const snapshot = { ...op };
+    return this.mutate(() => this.appendOp(this.linkWrite(snapshot)));
+  }
+
+  private async appendOp(op: QueuedOp): Promise<number> {
+    const entry: QueueEntry = { id: this.nextId, ts: Date.now(), op };
     const line = serialiseOp(entry);
     const lineBytes = byteLengthUtf8(line);
     if (this.bytesUsed + lineBytes > this.maxBytes) {
-      this.nextId--; // give the id back so subsequent enqueues stay tight
       throw new Error(
         `OfflineQueue: enqueue would exceed cap (${this.bytesUsed + lineBytes} > ${this.maxBytes} bytes)`,
       );
     }
     await fs.appendFile(this.logFile, line + '\n', 'utf8');
+    this.nextId++;
     this.pendingMap.set(entry.id, entry);
     this.bytesUsed += lineBytes;
     this.logFileBytes += lineBytes + 1; // +1 for newline
@@ -134,34 +152,35 @@ export class OfflineQueue {
    * compaction when the on-disk log has grown past 2× the live
    * pending bytes.
    */
-  async markCompleted(id: number): Promise<void> {
-    const entry = this.pendingMap.get(id);
-    if (!entry) return;
-    const tombstone = serialiseTombstone(id);
-    await fs.appendFile(this.logFile, tombstone + '\n', 'utf8');
-    this.logFileBytes += byteLengthUtf8(tombstone) + 1;
-    this.pendingMap.delete(id);
-    this.bytesUsed -= byteLengthUtf8(serialiseOp(entry));
-    if (this.bytesUsed < 0) this.bytesUsed = 0;
+  markCompleted(id: number, committedMtime?: number): Promise<void> {
+    return this.mutate(async () => {
+      if (!this.pendingMap.has(id)) return;
+      const tombstone = JSON.stringify({ type: 'completed', id, ts: Date.now(), committedMtime });
+      // Completion and dependent preconditions are one record: a restart must
+      // never observe the first write gone but its successor using a fake mtime.
+      await fs.appendFile(this.logFile, tombstone + '\n', 'utf8');
+      this.logFileBytes += byteLengthUtf8(tombstone) + 1;
+      this.applyCompleted(id, committedMtime);
 
-    if (this.shouldCompact()) {
-      await this.compact();
-    }
+      if (this.shouldCompact()) await this.rewriteLog(this.pending());
+    });
   }
 
   /** Drop everything. Atomic: a fresh log replaces the old one. */
-  async clear(): Promise<void> {
-    this.pendingMap.clear();
-    this.bytesUsed = 0;
-    await this.rewriteLog([]);
+  clear(): Promise<void> {
+    return this.mutate(async () => {
+      await this.rewriteLog([]);
+      this.pendingMap.clear();
+      this.bytesUsed = 0;
+    });
   }
 
   /**
    * Manually trigger a compaction pass. Useful in tests; production
    * code calls this implicitly via `markCompleted`.
    */
-  async compact(): Promise<void> {
-    await this.rewriteLog(this.pending());
+  compact(): Promise<void> {
+    return this.mutate(() => this.rewriteLog(this.pending()));
   }
 
   stats(): QueueStats {
@@ -174,6 +193,67 @@ export class OfflineQueue {
   }
 
   // ─── internals ─────────────────────────────────────────────────────────
+
+  private mutate<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.mutations.then(operation);
+    // A failed disk operation must surface to its caller without poisoning
+    // subsequent saves or preventing the user from retrying.
+    this.mutations = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  private linkWrite(op: QueuedWriteOp): QueuedWriteOp {
+    const linked = { ...op, expectedMtime: op.expectedMtime ?? 0 };
+    delete linked.dependsOn;
+    let lookupPath = op.path;
+    for (const entry of this.pending().reverse()) {
+      const prior = entry.op;
+      if (isWrite(prior) && prior.path === lookupPath) {
+        linked.dependsOn = entry.id;
+        linked.expectedMtime = prior.expectedMtime ?? 0;
+        return linked;
+      }
+      if (prior.kind === 'rename') {
+        if (containsPath(prior.newPath, lookupPath)) {
+          lookupPath = prior.oldPath + lookupPath.slice(prior.newPath.length);
+        } else if (containsPath(prior.oldPath, lookupPath)) {
+          return { ...linked, expectedMtime: 0 };
+        }
+      } else if (
+        (prior.kind === 'remove' || prior.kind === 'rmdir' || prior.kind === 'trashLocal')
+        && containsPath(prior.path, lookupPath)
+      ) {
+        return { ...linked, expectedMtime: 0 };
+      } else if (
+        ((prior.kind === 'append' || prior.kind === 'appendBinary') && prior.path === lookupPath)
+        || (prior.kind === 'copy' && containsPath(prior.dstPath, lookupPath))
+      ) {
+        // These operations do not return a tracked version. Keeping the old
+        // precondition can prompt a conflict, but cannot waive one silently.
+        return linked;
+      }
+    }
+    return linked;
+  }
+
+  private applyCompleted(id: number, committedMtime?: number): void {
+    const dropped = this.pendingMap.get(id);
+    if (dropped) {
+      this.pendingMap.delete(id);
+      this.bytesUsed -= byteLengthUtf8(serialiseOp(dropped));
+    }
+    for (const entry of this.pendingMap.values()) {
+      if (!isWrite(entry.op) || entry.op.dependsOn !== id) continue;
+      const op = { ...entry.op };
+      delete op.dependsOn;
+      // No mtime means explicit discard, not a successful write. Retain the
+      // original precondition so the next local edit needs its own decision.
+      if (committedMtime !== undefined) op.expectedMtime = committedMtime;
+      const updated = { ...entry, op };
+      this.pendingMap.set(entry.id, updated);
+      this.bytesUsed += byteLengthUtf8(serialiseOp(updated)) - byteLengthUtf8(serialiseOp(entry));
+    }
+  }
 
   private async replayLog(): Promise<void> {
     let raw: string;
@@ -212,14 +292,11 @@ export class OfflineQueue {
         this.pendingMap.set(entry.id, entry);
         this.bytesUsed += byteLengthUtf8(serialiseOp(entry));
         if (entry.id >= this.nextId) this.nextId = entry.id + 1;
+      } else if (parsed.type === 'completed') {
+        this.applyCompleted(parsed.id, parsed.committedMtime);
+        this.nextId = Math.max(this.nextId, parsed.id + 1);
       } else {
-        // tombstone: drop any pending entry with this id
-        const dropped = this.pendingMap.get(parsed.id);
-        if (dropped) {
-          this.pendingMap.delete(parsed.id);
-          this.bytesUsed -= byteLengthUtf8(serialiseOp(dropped));
-          if (this.bytesUsed < 0) this.bytesUsed = 0;
-        }
+        this.nextId = Math.max(this.nextId, parsed.nextId);
       }
     }
   }
@@ -243,24 +320,12 @@ export class OfflineQueue {
    */
   private async rewriteLog(entries: QueueEntry[]): Promise<void> {
     const tmpPath = this.logFile + '.tmp';
-    const lines = entries.map(e => serialiseOp(e));
-    const body = lines.length === 0 ? '' : lines.join('\n') + '\n';
+    const lines = [JSON.stringify({ type: 'watermark', nextId: this.nextId }), ...entries.map(e => serialiseOp(e))];
+    const body = lines.join('\n') + '\n';
     await fs.writeFile(tmpPath, body, 'utf8');
-    // fs.rename overwrites on POSIX; on Windows it errors if dest
-    // exists, so use copyFile + unlink as a safe fallback. Try the
-    // fast path first.
-    try {
-      await fs.rename(tmpPath, this.logFile);
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === 'EEXIST' || process.platform === 'win32') {
-        // Best-effort overwrite: copy + unlink. Race window is small;
-        // worst case the next compaction tries again.
-        await fs.copyFile(tmpPath, this.logFile);
-        await fs.unlink(tmpPath).catch(() => { /* ignore */ });
-      } else {
-        throw e;
-      }
-    }
+    // Fail with the old log intact if atomic replacement is unavailable;
+    // copying over it could destroy the only durable copy on a failed write.
+    await fs.rename(tmpPath, this.logFile);
     this.logFileBytes = byteLengthUtf8(body);
   }
 }
@@ -268,16 +333,13 @@ export class OfflineQueue {
 // ─── (de)serialisation ───────────────────────────────────────────────────
 
 interface OpRecord { type: 'op'; id: number; ts: number; op: QueuedOp }
-interface TombstoneRecord { type: 'completed'; id: number; ts: number }
-type LogRecord = OpRecord | TombstoneRecord;
+interface TombstoneRecord { type: 'completed'; id: number; ts: number; committedMtime?: number }
+interface WatermarkRecord { type: 'watermark'; nextId: number }
+type LogRecord = OpRecord | TombstoneRecord | WatermarkRecord;
 
 function serialiseOp(entry: QueueEntry): string {
   return JSON.stringify({ type: 'op', id: entry.id, ts: entry.ts, op: entry.op });
 }
-function serialiseTombstone(id: number): string {
-  return JSON.stringify({ type: 'completed', id, ts: Date.now() });
-}
-
 function isLogRecord(v: unknown): v is LogRecord {
   if (!v || typeof v !== 'object') return false;
   const r = v as Partial<LogRecord>;
@@ -288,9 +350,19 @@ function isLogRecord(v: unknown): v is LogRecord {
       && typeof (r.op as { kind?: unknown }).kind === 'string';
   }
   if (r.type === 'completed') {
-    return typeof r.id === 'number' && typeof r.ts === 'number';
+    return typeof r.id === 'number' && typeof r.ts === 'number'
+      && (r.committedMtime === undefined || (typeof r.committedMtime === 'number' && Number.isFinite(r.committedMtime)));
   }
+  if (r.type === 'watermark') return Number.isSafeInteger(r.nextId) && r.nextId! > 0;
   return false;
+}
+
+function isWrite(op: QueuedOp): op is QueuedWriteOp {
+  return op.kind === 'write' || op.kind === 'writeBinary';
+}
+
+function containsPath(parent: string, child: string): boolean {
+  return parent === child || child.startsWith(parent + '/');
 }
 
 /**
@@ -306,4 +378,3 @@ function byteLengthUtf8(s: string): number {
   // hypothetical environments without TextEncoder.
   return s.length * 4;
 }
-

@@ -89,10 +89,31 @@ sequenceDiagram
 | `plugin/tests/integration/multiclient.rpc.test.ts` | The same scenarios over the RPC transport, plus `fs.watch` cross-client notifications. | A3 |
 | `plugin/tests/integration/helpers/makeAdapter.ts` | Factory that builds a fully-wired `SftpDataAdapter` for a given clientId. | A1 |
 | `plugin/tests/integration/helpers/deployDaemonOnce.ts` | `describe`-scoped helper that builds + deploys the Go daemon to the test sshd container so RPC tests can talk to it. Runtime deploy via `ServerDeployer`, same code path as production. | A2 |
+| `plugin/tests/integration/offline-replay.rpc.test.ts` | Persistent offline replay through a real local daemon: consecutive saves, restart, cancellation, concurrent modification, deletion, and interleaved rename/delete operations. No Docker or SSH required. | Offline safety |
 
 The pre-existing `npm run test:integration` script picks up everything
 under `tests/integration/` automatically — no new vitest config is
 required.
+
+### Offline replay without Docker
+
+The offline replay suite connects through a temporary Unix socket using the
+production RPC framing, authentication, client, and daemon handlers. It creates
+a fresh test vault, queue, and daemon home for each test and removes them on
+completion. It does not use any existing Obsidian vault or the system SSH service.
+
+On Linux amd64, build the daemon, then run only this suite from `plugin/`:
+
+```bash
+npm run build:server
+npx vitest run --config vitest.integration.config.ts tests/integration/offline-replay.rpc.test.ts
+```
+
+For macOS or arm64, pass the matching `--goos` and `--goarch` to the build script
+(for example, `npm run build:server -- --goos=darwin --goarch=arm64`). Alternatively,
+set `REMOTE_SSH_TEST_DAEMON` to an absolute path to an already-built host daemon.
+These tests cover real client/server behavior but do not replace the
+Docker SSH suite or Obsidian UI E2E tests.
 
 ### Daemon deploy strategy
 

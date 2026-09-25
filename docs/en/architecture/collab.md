@@ -104,6 +104,35 @@ stateDiagram-v2
 | β3 | `QueueReplayer`: on connection recovery, drains the queue serially against the remote. PreconditionFailed → α3 path (3-way modal). Success → next op. Failure surfaces as a notice; remaining queue stays. |
 | β4 | StatusBar shows "N pending offline edits" while the queue is non-empty; clicking opens `PendingEditsModal` listing the pending ops with the option to discard. |
 
+### Replay integrity
+
+- Cancellation (including modal dismissal or callback failure) stops the FIFO
+  drain and retains the edit plus all later operations. Only a successful
+  commit or explicit **Keep theirs** decision completes that entry. An absent
+  conflict handler is an error, never an implicit discard.
+- Each full-file save records either a remote mtime or a dependency on the
+  previous pending save. Dependency lookup follows file/directory renames;
+  remove/rmdir/trash and a vacated rename source start a new generation.
+  Unknown baselines use create-only zero instead of an unconditional write.
+- A completion record atomically advances dependent expectations using the
+  RPC write response's mtime, not the synthetic editor-cache timestamp or a
+  later stat. Opening/compacting the log preserves those expectations. A
+  merged result that differs from the queued snapshot does not automatically
+  authorize later snapshots to overwrite the merge; they need another decision.
+- Appends, completions, clear, and compaction are serialized within a queue
+  owner. New saves stay behind pending edits after reconnection; replay does
+  not call the public enqueueing paths. Overlapping drains share one run.
+- Copy/legacy-append barriers and upgraded legacy logs may conservatively
+  need another conflict decision. No unknown version is treated as consent.
+- The log survives normal process restarts, but append records are not fsynced;
+  this is not a guarantee against power loss or a corrupted/truncated log.
+  Remote commit and local completion are not an exactly-once transaction: a
+  lost response may require manual resolution on retry.
+
+The paired daemon uses protocol v2. See
+[conditional write integrity](../../../server/INTEGRITY.md) for its locking
+boundary, executable external-writer reproduction, and follow-up tasks.
+
 ## Non-functional / constraints
 
 - **N1** AncestorTracker is in-memory only. Cleared on disconnect /

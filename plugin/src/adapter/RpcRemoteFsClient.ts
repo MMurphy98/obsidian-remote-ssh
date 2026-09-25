@@ -16,7 +16,20 @@ import { withPerfTrace } from '../util/PerfTracer';
  * uses elsewhere.
  */
 export class RpcRemoteFsClient implements RemoteFsClient {
+  private conditionalWritesSupported: Promise<boolean> | undefined;
+
   constructor(private readonly rpc: RpcClient) {}
+
+  private async requireConditionalWrites(): Promise<void> {
+    // Older daemons interpret zero as an unconditional overwrite and recreate
+    // deleted files even with a nonzero expectation. Never silently downgrade.
+    this.conditionalWritesSupported ??= this.rpc.call('server.info', {}).then(
+      info => info.capabilities.includes('fs.write.preconditions.v2'),
+    );
+    if (!await this.conditionalWritesSupported) {
+      throw new Error('Upgrade the remote daemon: safe conditional writes require fs.write.preconditions.v2; the edit was not sent');
+    }
+  }
 
   // ─── lifecycle ─────────────────────────────────────────────────────────
 
@@ -87,14 +100,16 @@ export class RpcRemoteFsClient implements RemoteFsClient {
 
   // ─── write side ───────────────────────────────────────────────────────
 
-  async writeBinary(path: string, data: Buffer, expectedMtime?: number): Promise<void> {
-    await withPerfTrace('S.rpc', { method: 'fs.writeBinary', path, bytes: data.length }, () =>
+  async writeBinary(path: string, data: Buffer, expectedMtime?: number): Promise<number> {
+    if (expectedMtime !== undefined) await this.requireConditionalWrites();
+    const result = await withPerfTrace('S.rpc', { method: 'fs.writeBinary', path, bytes: data.length }, () =>
       this.rpc.call('fs.writeBinary', {
         path,
         contentBase64: data.toString('base64'),
         ...(expectedMtime !== undefined ? { expectedMtime } : {}),
       }),
     );
+    return result.mtime;
   }
 
   async mkdirp(path: string): Promise<void> {

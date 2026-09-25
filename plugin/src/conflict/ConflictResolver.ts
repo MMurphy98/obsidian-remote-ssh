@@ -16,6 +16,25 @@ export type TextConflictDecision =
   | { decision: 'merged'; content: string }
   | { decision: 'cancel' };
 
+/** A decision to stop writing is distinct from a failed precondition. */
+export class ConflictResolutionStopped extends Error {
+  readonly code = -32020;
+  readonly cause: unknown;
+  constructor(readonly decision: 'cancelled' | 'discarded', originalError: unknown) {
+    super(decision === 'cancelled'
+      ? 'Write conflict cancelled; the local edit remains pending'
+      : 'Local edit explicitly discarded in favour of the remote version');
+    this.cause = originalError;
+    this.name = 'ConflictResolutionStopped';
+  }
+}
+
+export interface ResolvedWrite {
+  data: Buffer;
+  /** The version returned by the write itself, never a later stat. */
+  mtime?: number;
+}
+
 export type WriteConflictCallback = (vaultPath: string) => Promise<boolean>;
 export type TextConflictCallback = (
   vaultPath: string,
@@ -52,10 +71,9 @@ export class ConflictResolver {
 
   /**
    * Run the conflict-resolution stack (text 3-way → legacy two-choice
-   * → rethrow). Returns the data that was actually written, which may
-   * differ from the original write when the user chose `merged`. On
-   * cancel / keep-theirs / no-callback, throws the original error so
-   * the caller's outer try/catch in `writeBuffer` re-surfaces it.
+   * → rethrow). Returns the bytes and version actually committed.
+   * Cancellation and explicit discard have distinct typed outcomes;
+   * an unavailable callback or failed write never implies user consent.
    */
   async resolve(
     normalizedPath: string,
@@ -63,11 +81,16 @@ export class ConflictResolver {
     mine: Buffer,
     isText: boolean,
     originalError: unknown,
-  ): Promise<Buffer> {
+  ): Promise<ResolvedWrite> {
     if (isText && this.ancestorTracker && this.onTextConflict) {
       const ancestor = this.ancestorTracker.get(normalizedPath);
       if (ancestor !== null) {
         let theirsBuf: Buffer;
+        // Sample before reading, never after the modal: a later stat could
+        // bless old displayed bytes with a version the user never saw.
+        let theirsMtime = 0;
+        try { theirsMtime = (await this.client.stat(remote)).mtime; }
+        catch { /* Unknown version stays conservative (create-only). */ }
         try {
           theirsBuf = await this.client.readBinary(remote);
         } catch (re) {
@@ -84,28 +107,24 @@ export class ConflictResolver {
         }).catch(() => ({ decision: 'cancel' as const }));
 
         switch (decision.decision) {
-          case 'keep-mine':
-            await this.client.writeBinary(remote, mine);
-            return mine;
+          case 'keep-mine': {
+            const mtime = await this.client.writeBinary(remote, mine);
+            return { data: mine, mtime: mtime ?? undefined };
+          }
           case 'merged': {
             const merged = Buffer.from(decision.content, 'utf8');
-            await this.client.writeBinary(remote, merged);
-            return merged;
+            const mtime = await this.client.writeBinary(remote, merged);
+            return { data: merged, mtime: mtime ?? undefined };
           }
           case 'keep-theirs': {
-            let mtime = 0;
-            try {
-              const s = await this.client.stat(remote);
-              mtime = s.mtime;
-            } catch { /* best effort */ }
-            this.readCache.put(remote, theirsBuf, mtime);
+            this.readCache.put(remote, theirsBuf, theirsMtime);
             if (this.ancestorTracker) {
-              this.ancestorTracker.remember(normalizedPath, theirsBuf.toString('utf8'), mtime);
+              this.ancestorTracker.remember(normalizedPath, theirsBuf.toString('utf8'), theirsMtime);
             }
-            throw originalError;
+            throw new ConflictResolutionStopped('discarded', originalError);
           }
           case 'cancel':
-            throw originalError;
+            throw new ConflictResolutionStopped('cancelled', originalError);
         }
       }
     }
@@ -115,18 +134,20 @@ export class ConflictResolver {
   /**
    * Two-choice (overwrite / cancel) conflict path — the binary
    * fallback and the no-ancestor fallback for text. Throws on
-   * cancel; returns `mine` on overwrite.
+   * cancel; returns the committed bytes and version on overwrite.
    */
   private async fallbackTwoChoice(
     normalizedPath: string,
     remote: string,
     mine: Buffer,
     originalError: unknown,
-  ): Promise<Buffer> {
-    if (!this.onWriteConflict) throw originalError;
+  ): Promise<ResolvedWrite> {
+    if (!this.onWriteConflict) {
+      throw new Error('Write conflict cannot be resolved: no conflict handler is available; the local edit remains pending');
+    }
     const overwrite = await this.onWriteConflict(normalizedPath).catch(() => false);
-    if (!overwrite) throw originalError;
-    await this.client.writeBinary(remote, mine);
-    return mine;
+    if (!overwrite) throw new ConflictResolutionStopped('cancelled', originalError);
+    const mtime = await this.client.writeBinary(remote, mine);
+    return { data: mine, mtime: mtime ?? undefined };
   }
 }

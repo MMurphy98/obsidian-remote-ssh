@@ -87,7 +87,7 @@ describe('ConflictResolver.resolve — 3-way text path', () => {
       { writeBinary: writeSpy },
     );
     const result = await resolver.resolve(NORM_PATH, REMOTE_PATH, MINE, true, ORIGINAL_ERROR);
-    expect(result).toBe(MINE);
+    expect(result.data).toBe(MINE);
     expect(writeSpy).toHaveBeenCalledWith(REMOTE_PATH, MINE);
   });
 
@@ -98,14 +98,14 @@ describe('ConflictResolver.resolve — 3-way text path', () => {
       { writeBinary: writeSpy },
     );
     const result = await resolver.resolve(NORM_PATH, REMOTE_PATH, MINE, true, ORIGINAL_ERROR);
-    expect(result.toString('utf8')).toBe('hand-merged result');
+    expect(result.data.toString('utf8')).toBe('hand-merged result');
     expect(writeSpy).toHaveBeenCalledWith(
       REMOTE_PATH,
       Buffer.from('hand-merged result', 'utf8'),
     );
   });
 
-  it('keep-theirs: updates read cache, updates ancestor, and rethrows originalError', async () => {
+  it('keep-theirs: updates read cache, updates ancestor, and reports explicit discard', async () => {
     const remoteBuf = Buffer.from('their version');
     const statSpy   = vi.fn(async (): Promise<RemoteStat> => ({ isFile: true, isDirectory: false, isSymbolicLink: false, mtime: 9999, size: 13, mode: 0o644 }));
     const { resolver, cache, tracker } = makeText3Way(
@@ -113,7 +113,7 @@ describe('ConflictResolver.resolve — 3-way text path', () => {
       { readBinary: async () => remoteBuf, stat: statSpy },
     );
     await expect(resolver.resolve(NORM_PATH, REMOTE_PATH, MINE, true, ORIGINAL_ERROR))
-      .rejects.toBe(ORIGINAL_ERROR);
+      .rejects.toMatchObject({ decision: 'discarded', cause: ORIGINAL_ERROR });
     // Cache must reflect the remote version.
     expect(cache.get(REMOTE_PATH)?.data).toEqual(remoteBuf);
     expect(cache.get(REMOTE_PATH)?.mtime).toBe(9999);
@@ -132,20 +132,31 @@ describe('ConflictResolver.resolve — 3-way text path', () => {
       },
     );
     await expect(resolver.resolve(NORM_PATH, REMOTE_PATH, MINE, true, ORIGINAL_ERROR))
-      .rejects.toBe(ORIGINAL_ERROR);
+      .rejects.toMatchObject({ decision: 'discarded', cause: ORIGINAL_ERROR });
     expect(cache.get(REMOTE_PATH)?.mtime).toBe(0);
   });
 
-  it('cancel: rethrows originalError', async () => {
-    const { resolver } = makeText3Way(async () => ({ decision: 'cancel' }));
+  it('keep-theirs never associates displayed content with a later remote revision', async () => {
+    let remoteMtime = 100;
+    const { resolver, cache } = makeText3Way(
+      async () => { remoteMtime = 200; return { decision: 'keep-theirs' }; },
+      { stat: async () => ({ isFile: true, isDirectory: false, isSymbolicLink: false, mtime: remoteMtime, size: 14, mode: 0o644 }) },
+    );
     await expect(resolver.resolve(NORM_PATH, REMOTE_PATH, MINE, true, ORIGINAL_ERROR))
-      .rejects.toBe(ORIGINAL_ERROR);
+      .rejects.toMatchObject({ decision: 'discarded' });
+    expect(cache.peek(REMOTE_PATH)?.mtime).toBe(100);
   });
 
-  it('onTextConflict rejection is treated as cancel — rethrows originalError', async () => {
+  it('cancel: reports cancellation', async () => {
+    const { resolver } = makeText3Way(async () => ({ decision: 'cancel' }));
+    await expect(resolver.resolve(NORM_PATH, REMOTE_PATH, MINE, true, ORIGINAL_ERROR))
+      .rejects.toMatchObject({ decision: 'cancelled', cause: ORIGINAL_ERROR });
+  });
+
+  it('onTextConflict rejection is treated as cancel — reports cancellation', async () => {
     const { resolver } = makeText3Way(async () => { throw new Error('modal closed'); });
     await expect(resolver.resolve(NORM_PATH, REMOTE_PATH, MINE, true, ORIGINAL_ERROR))
-      .rejects.toBe(ORIGINAL_ERROR);
+      .rejects.toMatchObject({ decision: 'cancelled', cause: ORIGINAL_ERROR });
   });
 
   it('readBinary failure falls back to two-choice modal (no onWriteConflict → rethrows)', async () => {
@@ -159,7 +170,7 @@ describe('ConflictResolver.resolve — 3-way text path', () => {
       null, // no onWriteConflict
     );
     await expect(resolver.resolve(NORM_PATH, REMOTE_PATH, MINE, true, ORIGINAL_ERROR))
-      .rejects.toBe(ORIGINAL_ERROR);
+      .rejects.toThrow(/no conflict handler is available/);
   });
 
   it('readBinary failure falls back to two-choice modal (onWriteConflict true → returns mine)', async () => {
@@ -174,7 +185,7 @@ describe('ConflictResolver.resolve — 3-way text path', () => {
       async () => true,
     );
     const result = await resolver.resolve(NORM_PATH, REMOTE_PATH, MINE, true, ORIGINAL_ERROR);
-    expect(result).toBe(MINE);
+    expect(result.data).toBe(MINE);
     expect(writeSpy).toHaveBeenCalledWith(REMOTE_PATH, MINE);
   });
 
@@ -188,7 +199,7 @@ describe('ConflictResolver.resolve — 3-way text path', () => {
       async () => false,        // user cancels
     );
     await expect(resolver.resolve(NORM_PATH, REMOTE_PATH, MINE, true, ORIGINAL_ERROR))
-      .rejects.toBe(ORIGINAL_ERROR);
+      .rejects.toMatchObject({ decision: 'cancelled', cause: ORIGINAL_ERROR });
   });
 });
 
@@ -200,7 +211,7 @@ describe('ConflictResolver.resolve — two-choice fallback (binary / no ancestor
       makeClient(), new ReadCache(), null, null, null,
     );
     await expect(resolver.resolve(NORM_PATH, REMOTE_PATH, MINE, false, ORIGINAL_ERROR))
-      .rejects.toBe(ORIGINAL_ERROR);
+      .rejects.toThrow(/no conflict handler is available/);
   });
 
   it('onWriteConflict returns false → rethrows originalError', async () => {
@@ -208,7 +219,7 @@ describe('ConflictResolver.resolve — two-choice fallback (binary / no ancestor
       makeClient(), new ReadCache(), null, null, async () => false,
     );
     await expect(resolver.resolve(NORM_PATH, REMOTE_PATH, MINE, false, ORIGINAL_ERROR))
-      .rejects.toBe(ORIGINAL_ERROR);
+      .rejects.toMatchObject({ decision: 'cancelled', cause: ORIGINAL_ERROR });
   });
 
   it('onWriteConflict rejects → treated as false → rethrows originalError', async () => {
@@ -217,7 +228,7 @@ describe('ConflictResolver.resolve — two-choice fallback (binary / no ancestor
       async () => { throw new Error('modal error'); },
     );
     await expect(resolver.resolve(NORM_PATH, REMOTE_PATH, MINE, false, ORIGINAL_ERROR))
-      .rejects.toBe(ORIGINAL_ERROR);
+      .rejects.toMatchObject({ decision: 'cancelled', cause: ORIGINAL_ERROR });
   });
 
   it('onWriteConflict returns true → writes mine and returns mine', async () => {
@@ -227,7 +238,7 @@ describe('ConflictResolver.resolve — two-choice fallback (binary / no ancestor
       new ReadCache(), null, null, async () => true,
     );
     const result = await resolver.resolve(NORM_PATH, REMOTE_PATH, MINE, false, ORIGINAL_ERROR);
-    expect(result).toBe(MINE);
+    expect(result.data).toBe(MINE);
     expect(writeSpy).toHaveBeenCalledWith(REMOTE_PATH, MINE);
   });
 
@@ -239,7 +250,7 @@ describe('ConflictResolver.resolve — two-choice fallback (binary / no ancestor
       makeClient(), new ReadCache(), tracker, onTextConflict, async () => false,
     );
     await expect(resolver.resolve(NORM_PATH, REMOTE_PATH, MINE, false, ORIGINAL_ERROR))
-      .rejects.toBe(ORIGINAL_ERROR);
+      .rejects.toMatchObject({ decision: 'cancelled', cause: ORIGINAL_ERROR });
     expect(onTextConflict).not.toHaveBeenCalled();
   });
 
@@ -249,7 +260,7 @@ describe('ConflictResolver.resolve — two-choice fallback (binary / no ancestor
       makeClient(), new ReadCache(), null, onTextConflict, async () => false,
     );
     await expect(resolver.resolve(NORM_PATH, REMOTE_PATH, MINE, true, ORIGINAL_ERROR))
-      .rejects.toBe(ORIGINAL_ERROR);
+      .rejects.toMatchObject({ decision: 'cancelled', cause: ORIGINAL_ERROR });
     expect(onTextConflict).not.toHaveBeenCalled();
   });
 
@@ -260,6 +271,6 @@ describe('ConflictResolver.resolve — two-choice fallback (binary / no ancestor
       makeClient(), new ReadCache(), tracker, null, async () => false,
     );
     await expect(resolver.resolve(NORM_PATH, REMOTE_PATH, MINE, true, ORIGINAL_ERROR))
-      .rejects.toBe(ORIGINAL_ERROR);
+      .rejects.toMatchObject({ decision: 'cancelled', cause: ORIGINAL_ERROR });
   });
 });
