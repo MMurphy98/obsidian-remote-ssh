@@ -33,10 +33,11 @@ export class StatusBar {
     this.update(SyncState.IDLE);
   }
 
-  update(state: SyncState, detail?: string) {
-    this.el.setText(`${ICON[state]} ${detail ?? LABEL[state]}`);
+  update(state: SyncState, detail?: string, warning?: string) {
+    this.el.setText(`${warning ? '⚠' : ICON[state]} ${detail ?? LABEL[state]}`);
+    this.el.title = warning ?? '';
     this.el.className = 'remote-ssh-status';
-    const cls = CSS_CLASS[state];
+    const cls = warning ? 'is-warning' : CSS_CLASS[state];
     if (cls) this.el.addClass(cls);
   }
 

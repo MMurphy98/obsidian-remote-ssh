@@ -6,34 +6,43 @@ description: "How obsidian-remote-ssh detects and surfaces edit conflicts. mtime
 
 # Conflict handling
 
-When the same file is edited locally (in Obsidian's shadow vault) AND remotely (in a terminal, by another client, by a sync tool) at the same time, obsidian-remote-ssh detects the conflict and offers a resolution.
+RPC writes compare the remote file's modification time with the version the
+editor last read. A changed or deleted file produces a conflict instead of
+silently accepting an old edit. Unknown offline baselines use create-only
+writes, which cannot replace an existing file. The plugin and daemon must
+both support protocol v2 and `fs.write.preconditions.v2`.
 
-## How conflicts are detected
+## Resolving a conflict
 
-Every write through the daemon carries an **expected mtime** precondition (see [[en/api/filesystem|fs.write]]). When the daemon's view of the file's current mtime does not match what the client expected, the daemon refuses with `PreconditionFailed (-32020)`.
+For text with an in-memory ancestor, the dialog shows ancestor, mine, and
+theirs. **Keep mine** or **Save merged** writes the chosen content. **Keep
+theirs** explicitly discards the corresponding local edit. **Cancel**, Escape,
+or closing the dialog retains a queued edit and stops replay, including any
+later rename/delete operations. Missing conflict handlers and failed writes
+also leave edits pending and report an error.
 
-This catches:
+After an application restart, ancestors are not available. Text without an
+ancestor and binary writes use **Overwrite remote** / **Cancel** instead.
+Cancellation retains the queue in this fallback too. The pending-edits status
+shows retained work; it retries on the next connection. Further saves queue
+behind it, so reconnect before expecting those changes to reach the remote.
 
-- A note edited on the remote (vim, another Obsidian) while you have it open locally.
-- Your other device editing the same vault via its own shadow.
-- A cron / sync tool (Syncthing, rsync) touching the file mid-edit.
+There is no automatic backup of a discarded or overwritten version. Choosing
+an overwrite is an explicit force-write and can replace changes that arrive
+while the dialog is open. Copy any version you need to keep before accepting.
 
-## What you'll see
+## Protection limits
 
-A toast appears in the bottom-right:
+SFTP has no atomic conflict check. Both an SFTP connection and a downgrade
+from RPC show a persistent **SFTP — no conflict protection** warning; saves
+can overwrite another writer's changes.
 
-```
-Conflict in note.md — remote was modified after you opened it
-[ Keep local ]   [ Keep remote ]   [ View diff ]
-```
-
-- **Keep local** — overwrite the remote with your in-Obsidian content.
-- **Keep remote** — discard your edits and load the remote version.
-- **View diff** — open a side-by-side diff in a temporary buffer; choose per-line which side wins.
-
-> **There is no automatic backup of the rejected side.** "Keep remote" overwrites your in-Obsidian edits with the remote content; "Keep local" overwrites the remote with your in-Obsidian content. If you might want both versions, copy the one you'd lose into a separate file before clicking — there is no `.bak` to recover from.
->
-> An automatic conflict-backup mechanism is on the roadmap.
+The RPC lock coordinates upgraded daemons serving the same vault root.
+Ordinary local Obsidian, terminal editors, sync tools, SFTP, and old daemons
+do not participate. Their changes can still race the final write, and edits
+that preserve a timestamp can escape mtime checks. See the
+[reproduction and follow-up design](../../../server/INTEGRITY.md). Avoid those
+concurrent writers when relying on the RPC protection.
 
 ## Reducing conflicts
 

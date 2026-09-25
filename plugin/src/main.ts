@@ -69,6 +69,10 @@ import { telemetry, telemetryLogPath } from "./util/Telemetry";
 /** GitHub `owner/repo` the daemon binaries are released from. */
 const DAEMON_RELEASE_REPO = 'sotashimozono/obsidian-remote-ssh';
 
+const SFTP_CONFLICT_WARNING =
+  'Conflict protection is unavailable on SFTP. Saves can overwrite remote edits ' +
+  'without a conflict prompt. Avoid concurrent edits until RPC is restored.';
+
 /**
  * Everything this plugin keeps OUTSIDE any vault, on every OS:
  * `~/.obsidian-remote/` — the shadow `vaults/` themselves, plus the
@@ -517,7 +521,7 @@ export default class RemoteSshPlugin extends Plugin {
         // whole connect — a hard failure skips populate and strands the user
         // on an EMPTY vault. SFTP shares the same live SSH channel, so
         // read/write/sync still work (minus daemon-only features: fast walk,
-        // thumbnails, live watch, image/PDF rendering).
+        // thumbnails, live watch, image/PDF rendering, conflict protection).
         //
         // EXCEPTION: a daemon binary that fails integrity verification
         // (checksum mismatch / bad manifest) fails LOUD and does NOT
@@ -566,7 +570,9 @@ export default class RemoteSshPlugin extends Plugin {
 
     const userLabel = ConnectionManager.formatUserLabel(this.settings);
     new Notice(
-      `Remote SSH: Connected to ${profile.name} as ${userLabel} via ${transport.toUpperCase()}${rpcSummary}`,
+      `Remote SSH: Connected to ${profile.name} as ${userLabel} via ${transport.toUpperCase()}${rpcSummary}` +
+        (transport === 'sftp' ? `\n${SFTP_CONFLICT_WARNING}` : ''),
+      transport === 'sftp' ? 15000 : undefined,
     );
     void this.adapterMgr.replayOfflineQueue('after-connect');
   }
@@ -835,7 +841,12 @@ export default class RemoteSshPlugin extends Plugin {
     } else if (s.kind === 'recovered') {
       this.adapterMgr.dataAdapter?.setReconnecting(false);
       this.setState(SyncState.CONNECTED);
-      new Notice('Remote SSH: reconnected');
+      new Notice(
+        this.conn.rpcConnection
+          ? 'Remote SSH: reconnected'
+          : `Remote SSH: reconnected via SFTP.\n${SFTP_CONFLICT_WARNING}`,
+        this.conn.rpcConnection ? undefined : 15000,
+      );
       this.conn.reconnectManager = null;
       // Drain any writes that landed during the disconnect. Fire-and-
       // forget: the user's already-back state is independent of the
@@ -1854,8 +1865,8 @@ export default class RemoteSshPlugin extends Plugin {
           `Remote SSH can download a small helper daemon (release ${version}) from ` +
           'this plugin’s GitHub release. It is uploaded to your SSH host and ' +
           'verified by sha256, and enables faster directory listing, live file ' +
-          'watch, and image/PDF previews. Decline to stay on plain SFTP (these ' +
-          'extras are then off).',
+          'watch, image/PDF previews, and write conflict checks. Decline to stay ' +
+          `on plain SFTP. ${SFTP_CONFLICT_WARNING}`,
       });
       let decided = false;
       const buttons = modal.contentEl.createDiv({ cls: 'modal-button-container' });
@@ -1874,7 +1885,13 @@ export default class RemoteSshPlugin extends Plugin {
 
   private setState(s: SyncState) {
     this.state = s;
-    this.statusBar?.update(s);
+    // Use the active transport, not the configured preference: reconnect can
+    // recover SSH successfully while downgrading an RPC profile to SFTP.
+    if (s === SyncState.CONNECTED && !this.conn.rpcConnection) {
+      this.statusBar?.update(s, 'Remote SSH: SFTP — no conflict protection', SFTP_CONFLICT_WARNING);
+    } else {
+      this.statusBar?.update(s);
+    }
   }
 
   /**
