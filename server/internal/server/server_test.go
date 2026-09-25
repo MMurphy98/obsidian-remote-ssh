@@ -496,7 +496,7 @@ func TestServer_AuthThenServerInfo(t *testing.T) {
 		"fs.remove", "fs.rename", "fs.rmdir",
 		"fs.stat", "fs.trashLocal",
 		"fs.unwatch", "fs.watch",
-		"fs.write", "fs.writeBinary",
+		"fs.write", "fs.write.preconditions.v2", "fs.writeBinary",
 		"server.info",
 	}
 	got := append([]string(nil), info.Capabilities...)

@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"sort"
 
 	"github.com/sotashimozono/obsidian-remote-ssh/server/internal/proto"
@@ -21,10 +22,17 @@ type InfoSource interface {
 // ServerInfo returns the handler for the `server.info` method.
 // `version` is the daemon's implementation version string; `vaultRoot`
 // is echoed to the client as documentation. Capabilities are the
-// current dispatcher's registered method names, sorted for stability.
+// current dispatcher's registered methods plus supported protocol semantics,
+// sorted for stability.
 func ServerInfo(src InfoSource, version, vaultRoot string) rpc.Handler {
 	return func(_ context.Context, _ json.RawMessage) (interface{}, *rpc.Error) {
-		capabilities := src.Methods()
+		capabilities := slices.Clone(src.Methods())
+		if slices.Contains(capabilities, "fs.write") && slices.Contains(capabilities, "fs.writeBinary") {
+			// Older daemons treat zero as unconditional and permit non-zero
+			// revisions to recreate deleted files. Clients must negotiate the
+			// stronger semantics before relying on conditional writes.
+			capabilities = append(capabilities, "fs.write.preconditions.v2")
+		}
 		sort.Strings(capabilities)
 		return proto.ServerInfo{
 			Version:         version,

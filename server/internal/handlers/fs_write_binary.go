@@ -28,7 +28,7 @@ import (
 // for atomic-rename writes when the watcher has been alive across an
 // earlier write to the same parent directory (#108).
 func FsWriteBinary(vaultRoot string, cor *correlator.Correlator, onModify func(relPath string)) rpc.Handler {
-	return func(ctx context.Context, params json.RawMessage) (interface{}, *rpc.Error) {
+	return withMutationLock(vaultRoot, func(ctx context.Context, params json.RawMessage) (interface{}, *rpc.Error) {
 		var p proto.WriteBinaryParams
 		if e := decodeParams("fs.writeBinary", params, &p); e != nil {
 			return nil, e
@@ -50,5 +50,5 @@ func FsWriteBinary(vaultRoot string, cor *correlator.Correlator, onModify func(r
 			onModify(p.Path)
 		}
 		return proto.MtimeResult{Mtime: mtime}, nil
-	}
+	})
 }

@@ -13,8 +13,8 @@ The wire has **two** versions:
 
 | Axis | Field | Today | Bumps when |
 |---|---|---|---|
-| **Protocol version** | `server.info.protocolVersion` (int) | `1` | A breaking change to existing methods (params/result shape, semantics, error codes) |
-| **Capabilities** | `server.info.capabilities` (sorted string array) | All registered method names — currently 22 | A new method is added (non-breaking); an old method is removed (breaking) |
+| **Protocol version** | `server.info.protocolVersion` (int) | `2` | A breaking change to existing methods (params/result shape, semantics, error codes) |
+| **Capabilities** | `server.info.capabilities` (sorted string array) | Registered method names and semantic feature flags | A new method is added (non-breaking); an old method is removed (breaking) |
 
 The protocol version is **the major-axis compatibility number**. Capabilities are the per-method feature flags within a protocol version.
 
@@ -34,7 +34,7 @@ This is intentional pre-2.0 — the cost of a redeploy is small (~5 s) and the s
 
 ## What's a breaking change
 
-Bumps `protocolVersion` (1 → 2):
+Bumps `protocolVersion` (for example 1 → 2):
 
 - Renaming an existing method
 - Removing a method
@@ -46,7 +46,7 @@ Bumps `protocolVersion` (1 → 2):
 
 ## What's a non-breaking change (capabilities-gated)
 
-Stays at `protocolVersion: 1`; new methods/fields advertised via `capabilities`:
+Keeps the current protocol version; new methods/fields are advertised via `capabilities`:
 
 - Adding a new method (e.g. a future `fs.search`) — added to `capabilities`; clients feature-detect by checking `capabilities.includes("fs.search")` before calling
 - Adding an optional field to an existing method's params (server defaults if absent)
@@ -68,9 +68,25 @@ if (info.capabilities.includes("fs.thumbnail")) {
 
 The plugin uses this exact pattern for `fs.thumbnail` — added partway through the 0.4.x cycle. Older daemons without it would fail the capability check; the plugin falls back to `fs.readBinary` + client-side resize.
 
+## Conditional-write protocol version 2
+
+Version 2 changes existing write semantics: `expectedMtime=0` now requires
+absence, and a nonzero version requires an existing matching file. Version 1
+interpreted zero as unconditional and allowed a missing update target to be
+recreated. This is a breaking semantic change, so both TS and Go constants
+advance together; a capability alone cannot protect older clients from the
+changed meaning. Clients also require `fs.write.preconditions.v2` for
+conditional writes, failing closed if it is missing.
+
+Deploy the matching plugin and daemon together on all clients. The existing
+strict handshake rejects version 1. The SFTP fallback is still available but
+has no conflict protection and displays a persistent warning. Do not downgrade
+a plugin while it has pending edits: old replayers do not understand the new
+queue dependencies and still have the cancellation/data-loss bug.
+
 ## Cross-version operability matrix
 
-For protocol version 1 (the only one shipped to date):
+Historical protocol version 1 deployment behavior:
 
 | Client version | Daemon version | Result |
 |---|---|---|

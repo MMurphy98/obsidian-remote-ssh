@@ -19,8 +19,8 @@ import {
  * both sides in the same PR.
  */
 describe('proto types', () => {
-  it('PROTOCOL_VERSION is 1', () => {
-    expect(PROTOCOL_VERSION).toBe(1);
+  it('PROTOCOL_VERSION is 2', () => {
+    expect(PROTOCOL_VERSION).toBe(2);
   });
 
   it('exposes the expected error code constants', () => {

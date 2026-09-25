@@ -45,3 +45,17 @@ func TestServerInfo_EchosVersionAndRoot(t *testing.T) {
 		}
 	}
 }
+
+func TestServerInfo_AdvertisesConditionalWriteSafety(t *testing.T) {
+	src := fakeInfoSource{methods: []string{"fs.write", "fs.writeBinary"}}
+	result, e := ServerInfo(src, "test", t.TempDir())(context.Background(), nil)
+	if e != nil {
+		t.Fatal(e)
+	}
+	for _, capability := range result.(proto.ServerInfo).Capabilities {
+		if capability == "fs.write.preconditions.v2" {
+			return
+		}
+	}
+	t.Fatal("missing capability for create-only and must-exist conditional writes")
+}

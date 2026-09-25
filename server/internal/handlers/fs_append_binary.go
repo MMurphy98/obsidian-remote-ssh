@@ -12,7 +12,7 @@ import (
 // FsAppendBinary returns the handler for `fs.appendBinary`.
 // Payload is std base64; decoding failures map to InvalidParams.
 func FsAppendBinary(vaultRoot string) rpc.Handler {
-	return func(_ context.Context, params json.RawMessage) (interface{}, *rpc.Error) {
+	return withMutationLock(vaultRoot, func(_ context.Context, params json.RawMessage) (interface{}, *rpc.Error) {
 		var p proto.AppendBinaryParams
 		if e := decodeParams("fs.appendBinary", params, &p); e != nil {
 			return nil, e
@@ -30,5 +30,5 @@ func FsAppendBinary(vaultRoot string) rpc.Handler {
 			return nil, e
 		}
 		return proto.MtimeResult{Mtime: mtime}, nil
-	}
+	})
 }

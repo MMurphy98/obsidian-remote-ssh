@@ -7,7 +7,7 @@
  * for the normative protocol description.
  */
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 // ─── core shapes ─────────────────────────────────────────────────────────────
 
@@ -16,7 +16,7 @@ export interface ServerInfo {
   version: string;
   /** Protocol version the daemon speaks. Must be compared against PROTOCOL_VERSION. */
   protocolVersion: number;
-  /** Method names the daemon implements, e.g. ["fs.stat", "fs.list", ...]. */
+  /** Implemented method names and semantic capability flags. */
   capabilities: string[];
   /**
    * Absolute vault root on the remote host (informational; paths are
@@ -189,12 +189,14 @@ export interface ReadBinaryRangeResult {
 export interface WriteTextParams {
   path: string;
   content: string;
-  /** If set, the write is rejected with PreconditionFailed when the remote mtime differs. */
+  /** Requires fs.write.preconditions.v2: zero = create-only; nonzero = existing matching mtime.
+   * Omitted = explicitly unconditional. A deleted target fails a nonzero precondition. */
   expectedMtime?: number;
 }
 export interface WriteBinaryParams {
   path: string;
   contentBase64: string;
+  /** Same conditional-write contract as WriteTextParams. */
   expectedMtime?: number;
 }
 export interface AppendTextParams { path: string; content: string }

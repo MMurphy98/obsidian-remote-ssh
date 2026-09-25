@@ -21,7 +21,7 @@ import (
 // "deleted" on the source AND a "created" on the dest) carries the
 // matching cid back to the client.
 func FsRename(vaultRoot string, cor *correlator.Correlator) rpc.Handler {
-	return func(ctx context.Context, params json.RawMessage) (interface{}, *rpc.Error) {
+	return withMutationLock(vaultRoot, func(ctx context.Context, params json.RawMessage) (interface{}, *rpc.Error) {
 		var p proto.RenameParams
 		if e := decodeParams("fs.rename", params, &p); e != nil {
 			return nil, e
@@ -34,6 +34,10 @@ func FsRename(vaultRoot string, cor *correlator.Correlator) rpc.Handler {
 		if e != nil {
 			return nil, e
 		}
+		previousDest, err := os.Stat(newAbs)
+		if err != nil && !os.IsNotExist(err) {
+			return nil, mapFsError(err, p.NewPath)
+		}
 		if err := os.MkdirAll(filepath.Dir(newAbs), 0o755); err != nil { // #nosec G301 — vault dir; 0755 matches Obsidian defaults
 			return nil, mapFsError(err, p.NewPath)
 		}
@@ -41,10 +45,15 @@ func FsRename(vaultRoot string, cor *correlator.Correlator) rpc.Handler {
 		if err := os.Rename(oldAbs, newAbs); err != nil {
 			return nil, mapFsError(err, p.OldPath)
 		}
+		// A different source may carry the exact same millisecond mtime
+		// as the replaced destination. Its old revision must not remain valid.
+		if err := advanceMtime(newAbs, previousDest); err != nil {
+			return nil, mapFsError(err, p.NewPath)
+		}
 		info, err := os.Stat(newAbs)
 		if err != nil {
 			return nil, mapFsError(err, p.NewPath)
 		}
 		return proto.MtimeResult{Mtime: info.ModTime().UnixMilli()}, nil
-	}
+	})
 }

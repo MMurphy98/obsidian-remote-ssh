@@ -25,6 +25,11 @@ Shared JSON-RPC protocol between the obsidian-remote-ssh plugin
 
 ## Handshake
 
+The current protocol version is **2**. Plugin and daemon must agree exactly.
+Version 2 changes the meaning of write `expectedMtime=0` and rejects deleted
+update targets; deploy both components together. Protected writes additionally
+require the `fs.write.preconditions.v2` capability. Version 1 is incompatible.
+
 Before any `fs.*` method succeeds, the client must authenticate:
 
 ```
@@ -118,9 +123,17 @@ interface ReadBinaryResult { contentBase64: string; mtime: number; size: number;
 ```
 
 Atomicity notes:
-- `fs.write` and `fs.writeBinary` are atomic on the remote (tmp file
-  + rename). If `expectedMtime` is set and the current file's mtime
-  does not match, the server rejects with `PreconditionFailed`.
+- `fs.write` and `fs.writeBinary` stage and sync a complete file before
+  publishing it. `expectedMtime` omitted/null means unconditional;
+  zero means create-only; nonzero requires an existing matching version.
+  A missing or mismatched update target produces `PreconditionFailed`.
+  Create-only uses atomic hard-link publication to prevent replacement.
+- All daemon mutations acquire a cross-process advisory lock on the vault
+  root. This closes the check/commit window between participating daemons
+  serving the same root inode. SFTP, local programs, older daemons, and
+  overlapping roots do not participate; see [remaining limitations](../server/INTEGRITY.md).
+- The write response returns the committed inode's mtime. It must not be
+  replaced with a later `fs.stat` result when advancing a queued edit.
 - `fs.rename` creates the destination's parent directory if needed.
 - `fs.copy` goes through the file contents (no server-side reflink).
 - `fs.trashLocal` moves the path under `<vaultRoot>/.trash/…`,

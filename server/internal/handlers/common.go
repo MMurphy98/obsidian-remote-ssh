@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/sotashimozono/obsidian-remote-ssh/server/internal/correlator"
 	"github.com/sotashimozono/obsidian-remote-ssh/server/internal/proto"
@@ -132,82 +133,122 @@ func isIsDirectoryErr(err error) bool {
 // default Obsidian produces on desktop (umask-applied 0644).
 const writeFilePerm = 0o644
 
-// atomicWriteFile writes data to abs via a sibling tmp file + rename,
-// so a crashed or partial write never leaves the destination in a
-// half-written state. Parent directories are created as needed.
-//
-// If expectedMtime is non-zero, the existing file (when present) must
-// have exactly that mtime in unix milliseconds, otherwise the function
-// returns PreconditionFailed without touching disk. A target that
-// does not exist at all is accepted unconditionally, even when
-// expectedMtime is set — this matches the Obsidian semantics of
-// "write the file, asserting it didn't change out from under me".
-//
-// Returns:
-//   - mtime: post-write mtime in unix milliseconds.
-//   - wasModify: true when the destination existed before the rename,
-//     false on a fresh create. Callers use this to decide whether to
-//     emit a synthetic Modified event into the watcher (#108 — Linux
-//     fsnotify drops the IN_MOVED_TO across an alive watcher, so the
-//     daemon's own writes need a workaround for live-update fanout).
-//   - rpc.Error on failure.
-//
-// relativePath is used solely to tag error messages with a path the
-// client recognises.
-func atomicWriteFile(abs, relativePath string, data []byte, expectedMtime int64) (int64, bool, *rpc.Error) {
-	// Probe existence up-front. Used both for the optional precondition
-	// check and to return wasModify so the caller can decide whether
-	// to emit a synthetic Modified event after the rename.
-	preExisted := false
-	if info, err := os.Stat(abs); err == nil {
-		preExisted = true
-		if expectedMtime != 0 {
-			got := info.ModTime().UnixMilli()
-			if got != expectedMtime {
-				return 0, false, rpc.ErrPreconditionFailed(
-					fmt.Sprintf("%s: expected mtime %d, found %d", relativePath, expectedMtime, got),
-				)
+// checkWritePrecondition distinguishes create-only (zero), update-only
+// (non-zero), and explicitly unconditional (nil) writes. Missing files are
+// conflicts for old revisions: replay must not undo a concurrent deletion.
+func checkWritePrecondition(abs, relativePath string, expectedMtime *int64) (os.FileInfo, *rpc.Error) {
+	info, err := os.Stat(abs)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, mapFsError(err, relativePath)
+	}
+	if expectedMtime != nil {
+		if *expectedMtime == 0 {
+			if info != nil {
+				return nil, rpc.ErrPreconditionFailed(relativePath + ": expected a missing file, found an existing target")
 			}
+		} else if info == nil {
+			return nil, rpc.ErrPreconditionFailed(relativePath + ": expected an existing file, but it was deleted or moved")
+		} else if got := mtimeMillis(info); got != *expectedMtime {
+			return nil, rpc.ErrPreconditionFailed(fmt.Sprintf("%s: expected mtime %d, found %d", relativePath, *expectedMtime, got))
 		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return 0, false, mapFsError(err, relativePath)
+	}
+	return info, nil
+}
+
+// advanceMtime prevents daemon writes within the same millisecond (or after
+// a clock adjustment) from reusing the previous optimistic concurrency token.
+// External writers can still preserve/restore mtimes; full protection from
+// those writers requires a stronger revision protocol and cooperation.
+func advanceMtime(abs string, previous os.FileInfo) error {
+	if previous == nil {
+		return nil
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return err
+	}
+	if mtimeMillis(info) > mtimeMillis(previous) {
+		return nil
+	}
+	next := time.UnixMilli(mtimeMillis(previous) + 1)
+	if err := os.Chtimes(abs, time.Now(), next); err != nil {
+		return err
+	}
+	info, err = os.Stat(abs)
+	if err != nil {
+		return err
+	}
+	if mtimeMillis(info) <= mtimeMillis(previous) {
+		return fmt.Errorf("filesystem cannot advance the write revision in milliseconds")
+	}
+	return nil
+}
+
+// atomicWriteFile stages a complete file and then publishes it atomically.
+// Its caller must hold the vault mutation lock through the whole operation.
+// expectedMtime=nil is unconditional, zero is create-only, and non-zero
+// requires an existing matching revision. Return the staged inode's mtime,
+// never a post-rename path stat that could describe someone else's write.
+// wasModify controls the synthetic watcher notification (#108).
+func atomicWriteFile(abs, relativePath string, data []byte, expectedMtime *int64) (int64, bool, *rpc.Error) {
+	previous, e := checkWritePrecondition(abs, relativePath, expectedMtime)
+	if e != nil {
+		return 0, false, e
 	}
 
 	parent := filepath.Dir(abs)
-	if err := os.MkdirAll(parent, 0o755); err != nil { // #nosec G301 — vault dir; 0755 intentional for Obsidian compat
+	if err := os.MkdirAll(parent, 0o755); err != nil { // #nosec G301 — vault directory
 		return 0, false, mapFsError(err, relativePath)
 	}
-
 	tmp, err := os.CreateTemp(parent, ".rsh-write-*.tmp")
 	if err != nil {
 		return 0, false, mapFsError(err, relativePath)
 	}
 	tmpPath := tmp.Name()
-	// Best-effort cleanup in every non-success path below.
-	cleanup := func() { _ = os.Remove(tmpPath) }
-
+	defer os.Remove(tmpPath)
+	defer tmp.Close()
 	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		cleanup()
 		return 0, false, mapFsError(err, relativePath)
 	}
-	if err := tmp.Close(); err != nil {
-		cleanup()
+	if err := tmp.Chmod(writeFilePerm); err != nil {
 		return 0, false, mapFsError(err, relativePath)
 	}
-	if err := os.Chmod(tmpPath, writeFilePerm); err != nil {
-		// Non-fatal on platforms that don't fully support chmod (e.g.
-		// some Windows filesystems): keep going.
-		_ = err
-	}
-	if err := os.Rename(tmpPath, abs); err != nil {
-		cleanup()
+	if err := advanceMtime(tmpPath, previous); err != nil {
 		return 0, false, mapFsError(err, relativePath)
 	}
-
-	info, err := os.Stat(abs)
+	if err := tmp.Sync(); err != nil {
+		return 0, false, mapFsError(err, relativePath)
+	}
+	committed, err := tmp.Stat()
 	if err != nil {
 		return 0, false, mapFsError(err, relativePath)
 	}
-	return info.ModTime().UnixMilli(), preExisted, nil
+	if err := tmp.Close(); err != nil {
+		return 0, false, mapFsError(err, relativePath)
+	}
+
+	// Recheck after staging to detect non-participating editors during the
+	// potentially long write. Advisory locking closes the window between
+	// participating daemons; external writes can still race this final check.
+	current, e := checkWritePrecondition(abs, relativePath, expectedMtime)
+	if e != nil {
+		return 0, false, e
+	}
+	if expectedMtime != nil && previous != nil &&
+		(!os.SameFile(previous, current) || !previous.ModTime().Equal(current.ModTime()) || previous.Size() != current.Size()) {
+		return 0, false, rpc.ErrPreconditionFailed(relativePath + ": file changed while preparing the write")
+	}
+	if expectedMtime != nil && *expectedMtime == 0 {
+		// Link publishes the staged inode only if the target is still absent.
+		// Unlike rename, this cannot overwrite even a non-cooperating creator.
+		if err := os.Link(tmpPath, abs); err != nil {
+			if errors.Is(err, fs.ErrExist) {
+				return 0, false, rpc.ErrPreconditionFailed(relativePath + ": another writer created the file")
+			}
+			return 0, false, mapFsError(err, relativePath)
+		}
+	} else if err := os.Rename(tmpPath, abs); err != nil {
+		return 0, false, mapFsError(err, relativePath)
+	}
+	return mtimeMillis(committed), previous != nil, nil
 }

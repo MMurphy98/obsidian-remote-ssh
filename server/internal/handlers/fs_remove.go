@@ -19,7 +19,7 @@ import (
 // Correlator so the fs.changed (deleted) notification carries the
 // matching cid.
 func FsRemove(vaultRoot string, cor *correlator.Correlator) rpc.Handler {
-	return func(ctx context.Context, params json.RawMessage) (interface{}, *rpc.Error) {
+	return withMutationLock(vaultRoot, func(ctx context.Context, params json.RawMessage) (interface{}, *rpc.Error) {
 		var p proto.PathOnlyParams
 		if e := decodeParams("fs.remove", params, &p); e != nil {
 			return nil, e
@@ -40,5 +40,5 @@ func FsRemove(vaultRoot string, cor *correlator.Correlator) rpc.Handler {
 			return nil, mapFsError(err, p.Path)
 		}
 		return struct{}{}, nil
-	}
+	})
 }

@@ -22,7 +22,7 @@ import (
 // writes when the watcher has been alive across an earlier write to
 // the same parent directory (#108).
 func FsCopy(vaultRoot string, onModify func(relPath string)) rpc.Handler {
-	return func(_ context.Context, params json.RawMessage) (interface{}, *rpc.Error) {
+	return withMutationLock(vaultRoot, func(_ context.Context, params json.RawMessage) (interface{}, *rpc.Error) {
 		var p proto.CopyParams
 		if e := decodeParams("fs.copy", params, &p); e != nil {
 			return nil, e
@@ -47,7 +47,7 @@ func FsCopy(vaultRoot string, onModify func(relPath string)) rpc.Handler {
 		if err != nil {
 			return nil, mapFsError(err, p.SrcPath)
 		}
-		mtime, wasModify, cerr := atomicWriteFile(dstAbs, p.DestPath, data, 0)
+		mtime, wasModify, cerr := atomicWriteFile(dstAbs, p.DestPath, data, nil)
 		if cerr != nil {
 			return nil, cerr
 		}
@@ -55,5 +55,5 @@ func FsCopy(vaultRoot string, onModify func(relPath string)) rpc.Handler {
 			onModify(p.DestPath)
 		}
 		return proto.MtimeResult{Mtime: mtime}, nil
-	}
+	})
 }

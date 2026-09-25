@@ -19,7 +19,7 @@ import (
 // Trashing the vault root is refused because it would collapse the
 // whole tree into `.trash/.trash/…`.
 func FsTrashLocal(vaultRoot string) rpc.Handler {
-	return func(_ context.Context, params json.RawMessage) (interface{}, *rpc.Error) {
+	return withMutationLock(vaultRoot, func(_ context.Context, params json.RawMessage) (interface{}, *rpc.Error) {
 		var p proto.PathOnlyParams
 		if e := decodeParams("fs.trashLocal", params, &p); e != nil {
 			return nil, e
@@ -42,12 +42,12 @@ func FsTrashLocal(vaultRoot string) rpc.Handler {
 			return nil, rpc.ErrPathOutsideVault(trashRel)
 		}
 
-		if err := os.MkdirAll(filepath.Dir(dstAbs), 0o755); err != nil { // #nosec G301 — vault .trash dir; path validated by vaultfs.Resolve
+		if err := os.MkdirAll(filepath.Dir(dstAbs), 0o755); err != nil { // #nosec G301 — vault .trash dir; path validated by vaultfs.Resolve
 			return nil, mapFsError(err, trashRel)
 		}
 		if err := os.Rename(srcAbs, dstAbs); err != nil {
 			return nil, mapFsError(err, p.Path)
 		}
 		return struct{}{}, nil
-	}
+	})
 }

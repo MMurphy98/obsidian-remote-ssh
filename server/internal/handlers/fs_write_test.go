@@ -22,6 +22,8 @@ func writeVault(t *testing.T) string {
 	return t.TempDir()
 }
 
+func writeMtime(value int64) *int64 { return &value }
+
 // ─── fs.write ────────────────────────────────────────────────────────────
 
 func TestFsWrite_CreatesFile(t *testing.T) {
@@ -85,7 +87,7 @@ func TestFsWrite_ExpectedMtimeFailsWhenDrifted(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "a.md"), []byte("seed"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	raw, _ := json.Marshal(proto.WriteTextParams{Path: "a.md", Content: "updated", ExpectedMtime: 1})
+	raw, _ := json.Marshal(proto.WriteTextParams{Path: "a.md", Content: "updated", ExpectedMtime: writeMtime(1)})
 	_, rerr := h(context.Background(), raw)
 	if rerr == nil || rerr.Code != proto.ErrorPreconditionFailed {
 		t.Fatalf("want PreconditionFailed, got %+v", rerr)
@@ -97,16 +99,17 @@ func TestFsWrite_ExpectedMtimeFailsWhenDrifted(t *testing.T) {
 	}
 }
 
-func TestFsWrite_ExpectedMtimeAcceptsNewFile(t *testing.T) {
-	// expectedMtime on a non-existent target is treated as "no constraint
-	// required — there's nothing to race". This matches the TS adapter's
-	// semantics where the client assumes "I think this file is new; create
-	// it atomically".
+func TestFsWrite_ExpectedMtimeRejectsMissingFile(t *testing.T) {
+	// A non-zero mtime refers to an existing remote revision. If another
+	// client deleted it, replay must not silently resurrect the old edit.
 	root := writeVault(t)
 	h := FsWrite(root, nil, nil)
-	raw, _ := json.Marshal(proto.WriteTextParams{Path: "new.md", Content: "fresh", ExpectedMtime: 12345})
-	if _, rerr := h(context.Background(), raw); rerr != nil {
-		t.Fatalf("unexpected error: %+v", rerr)
+	raw, _ := json.Marshal(proto.WriteTextParams{Path: "new.md", Content: "fresh", ExpectedMtime: writeMtime(12345)})
+	if _, rerr := h(context.Background(), raw); rerr == nil || rerr.Code != proto.ErrorPreconditionFailed {
+		t.Fatalf("want PreconditionFailed, got %+v", rerr)
+	}
+	if _, err := os.Stat(filepath.Join(root, "new.md")); !os.IsNotExist(err) {
+		t.Fatalf("stale write recreated a missing file: %v", err)
 	}
 }
 

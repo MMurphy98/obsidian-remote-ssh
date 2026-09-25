@@ -115,9 +115,9 @@ describe('establishRpcConnection', () => {
     stop();
   });
 
-  it('rejects with ProtocolVersionTooOld when versions disagree', async () => {
+  it.each([1, 999])('rejects incompatible protocol version %s before filesystem use', async protocolVersion => {
     const pair = duplexPair();
-    const stop = startFakeDaemon(pair.serverSide, { info: { protocolVersion: 999 } });
+    const stop = startFakeDaemon(pair.serverSide, { info: { protocolVersion } });
     try {
       await establishRpcConnection({ stream: pair.clientSide, token: 'good' });
       expect.fail('expected handshake to reject for protocol mismatch');

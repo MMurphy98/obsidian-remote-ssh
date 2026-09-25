@@ -19,7 +19,7 @@ import (
 // `recursive=false` uses os.Remove (which fails on non-empty dirs);
 // `recursive=true` uses os.RemoveAll.
 func FsRmdir(vaultRoot string) rpc.Handler {
-	return func(_ context.Context, params json.RawMessage) (interface{}, *rpc.Error) {
+	return withMutationLock(vaultRoot, func(_ context.Context, params json.RawMessage) (interface{}, *rpc.Error) {
 		var p proto.RmdirParams
 		if e := decodeParams("fs.rmdir", params, &p); e != nil {
 			return nil, e
@@ -48,5 +48,5 @@ func FsRmdir(vaultRoot string) rpc.Handler {
 			}
 		}
 		return struct{}{}, nil
-	}
+	})
 }

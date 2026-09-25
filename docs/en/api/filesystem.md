@@ -116,7 +116,15 @@ result: {
 ## Write
 
 ### `fs.write` / `fs.writeBinary`
-Atomic write (tmp file + rename). Fails with `PreconditionFailed (-32020)` if `expectedMtime` does not match current.
+Protocol v2 stages a complete file and publishes it atomically. With
+`expectedMtime=0`, only creation is allowed; a nonzero value requires an
+existing file with that mtime. A missing/mismatched update or an existing
+create target fails with `PreconditionFailed (-32020)`. Omitted/null means
+unconditional. Require `fs.write.preconditions.v2` before conditional writes.
+
+Participating daemons coordinate mutations through a shared vault-root lock.
+Local editors and SFTP do not share this lock; see the
+[concurrency limits and reproduction](../../../server/INTEGRITY.md).
 
 ```typescript
 params: {

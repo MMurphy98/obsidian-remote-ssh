@@ -19,7 +19,7 @@ import (
 // Creating the file on demand matches Obsidian's adapter.append which
 // callers treat as "create-or-append".
 func FsAppend(vaultRoot string) rpc.Handler {
-	return func(_ context.Context, params json.RawMessage) (interface{}, *rpc.Error) {
+	return withMutationLock(vaultRoot, func(_ context.Context, params json.RawMessage) (interface{}, *rpc.Error) {
 		var p proto.AppendTextParams
 		if e := decodeParams("fs.append", params, &p); e != nil {
 			return nil, e
@@ -33,12 +33,12 @@ func FsAppend(vaultRoot string) rpc.Handler {
 			return nil, e
 		}
 		return proto.MtimeResult{Mtime: mtime}, nil
-	}
+	})
 }
 
 // appendToFile is shared by fs.append and fs.appendBinary.
 func appendToFile(abs, relativePath string, data []byte) (int64, *rpc.Error) {
-	f, err := os.OpenFile(abs, os.O_WRONLY|os.O_APPEND|os.O_CREATE, writeFilePerm) // #nosec G304 — abs validated by resolveOrErr → vaultfs.Resolve
+	f, err := os.OpenFile(abs, os.O_WRONLY|os.O_APPEND|os.O_CREATE, writeFilePerm) // #nosec G304 — abs validated by resolveOrErr → vaultfs.Resolve
 	if err != nil {
 		// ENOENT on the parent dir surfaces here; let the caller decide
 		// whether to create it (we don't, to keep append cheap — the
@@ -49,8 +49,15 @@ func appendToFile(abs, relativePath string, data []byte) (int64, *rpc.Error) {
 		return 0, mapFsError(err, relativePath)
 	}
 	defer f.Close()
+	previous, err := f.Stat()
+	if err != nil {
+		return 0, mapFsError(err, relativePath)
+	}
 
 	if _, err := f.Write(data); err != nil {
+		return 0, mapFsError(err, relativePath)
+	}
+	if err := advanceMtime(abs, previous); err != nil {
 		return 0, mapFsError(err, relativePath)
 	}
 	if err := f.Sync(); err != nil {

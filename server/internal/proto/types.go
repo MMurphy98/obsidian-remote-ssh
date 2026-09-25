@@ -9,8 +9,9 @@ package proto
 import "encoding/json"
 
 // ProtocolVersion is the integer version negotiated at handshake.
-// Bump it for any breaking change on the wire.
-const ProtocolVersion = 1
+// Version 2 makes expectedMtime=0 create-only and non-zero revisions
+// require an existing target. Version 1 clients must not reuse this daemon.
+const ProtocolVersion = 2
 
 // ─── core shapes ────────────────────────────────────────────────────────────
 
@@ -125,16 +126,16 @@ type ReadBinaryRangeResult struct {
 }
 
 type WriteTextParams struct {
-	Path          string `json:"path"`
-	Content       string `json:"content"`
-	// ExpectedMtime, when non-zero, causes the write to fail with
-	// PreconditionFailed if the remote file's mtime differs.
-	ExpectedMtime int64 `json:"expectedMtime,omitempty"`
+	Path    string `json:"path"`
+	Content string `json:"content"`
+	// Nil permits an unconditional write. Zero requires a missing target;
+	// a non-zero value requires an existing file with that exact mtime.
+	ExpectedMtime *int64 `json:"expectedMtime,omitempty"`
 }
 type WriteBinaryParams struct {
 	Path          string `json:"path"`
 	ContentBase64 string `json:"contentBase64"`
-	ExpectedMtime int64  `json:"expectedMtime,omitempty"`
+	ExpectedMtime *int64 `json:"expectedMtime,omitempty"`
 }
 type AppendTextParams struct {
 	Path    string `json:"path"`

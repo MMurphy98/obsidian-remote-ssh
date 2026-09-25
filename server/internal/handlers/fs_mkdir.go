@@ -19,7 +19,7 @@ import (
 // already there as a dir (non-dir collisions bubble up as
 // PermissionDenied or Internal depending on the OS).
 func FsMkdir(vaultRoot string) rpc.Handler {
-	return func(_ context.Context, params json.RawMessage) (interface{}, *rpc.Error) {
+	return withMutationLock(vaultRoot, func(_ context.Context, params json.RawMessage) (interface{}, *rpc.Error) {
 		var p proto.MkdirParams
 		if e := decodeParams("fs.mkdir", params, &p); e != nil {
 			return nil, e
@@ -29,11 +29,11 @@ func FsMkdir(vaultRoot string) rpc.Handler {
 			return nil, e
 		}
 		if p.Recursive {
-			if err := os.MkdirAll(abs, 0o755); err != nil { // #nosec G301 — vault dir; 0755 matches Obsidian defaults
+			if err := os.MkdirAll(abs, 0o755); err != nil { // #nosec G301 — vault dir; 0755 matches Obsidian defaults
 				return nil, mapFsError(err, p.Path)
 			}
 		} else {
-			if err := os.Mkdir(abs, 0o755); err != nil { // #nosec G301 — vault dir; 0755 matches Obsidian defaults
+			if err := os.Mkdir(abs, 0o755); err != nil { // #nosec G301 — vault dir; 0755 matches Obsidian defaults
 				// An existing directory is fine; a regular file at the
 				// same path is a conflict (Exists).
 				if errors.Is(err, fs.ErrExist) {
@@ -46,5 +46,5 @@ func FsMkdir(vaultRoot string) rpc.Handler {
 			}
 		}
 		return struct{}{}, nil
-	}
+	})
 }
